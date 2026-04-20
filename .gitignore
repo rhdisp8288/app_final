@@ -1,0 +1,30 @@
+# Python cache
+__pycache__/
+*.pyc
+
+# Virtual environment
+.venv/
+venv/
+
+# VSCode
+.vscode/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Temporary files
+_tmp_pdf_uploads/
+_tmp_uploaded_financial_refs/
+tmp_pdf_pages/
+data/temp/
+
+# Streamlit
+.streamlit/
+
+# Logs
+*.log
+
+# Sensitive
+auth.json
+.env
