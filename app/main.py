@@ -6,12 +6,9 @@ sys.dont_write_bytecode = True
 import time
 import io
 import os
-import hashlib
-import importlib.util
 import difflib
 import re
 import socket
-import tempfile
 import urllib.request
 import streamlit as st
 import pandas as pd
@@ -20,21 +17,20 @@ import plotly.graph_objects as go
 from datetime import datetime
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
-import pypdfium2 as pdfium
 import json
 from typing import List, Dict, Optional, Any
-from rapidocr_onnxruntime import RapidOCR
-from quote_adequacy import (
+from app.analysis.quote_adequacy import (
     build_llm_context,
     evaluate_quote_adequacy,
     generate_html_report,
 )
-from industry_financial_db import (
-    build_estimated_industry_baseline,
-    ensure_workbook,
+from app.analysis.industry_research_report import (
+    build_industry_research_payload,
+    generate_industry_research_html,
+)
+from app.analysis.industry_financial_db import (
     get_baseline_items,
-    ingest_industry_statements,
-    load_industry_db,
+    list_available_baselines,
 )
 
 INDUSTRY_GROUP_LABELS = {
@@ -374,946 +370,6 @@ def load_uploaded_estimate_data(file_bytes):
     }
 
 
-FINANCIAL_UPLOAD_LABELS = {
-    "BS": "재무상태표(BS)",
-    "IS": "손익계산서(IS)",
-    "CF": "현금흐름표(CF)",
-    "COST": "제조원가명세서(COST, 선택)",
-}
-FINANCIAL_REQUIRED_UPLOADS = ("BS", "IS", "CF")
-FINANCIAL_UPLOAD_TYPES = ["pdf", "xlsx", "xlsm", "xls"]
-FINANCIAL_STATEMENT_DETECTION_RULES = {
-    "BS": ["재무상태표", "대차대조표", "balancesheet", "statementoffinancialposition"],
-    "IS": ["손익계산서", "포괄손익계산서", "incomestatement", "profitandloss", "statementofincome"],
-    "CF": ["현금흐름표", "cashflow", "statementofcashflows"],
-    "COST": ["제조원가명세서", "원가명세서", "costofgoodsmanufactured", "cogm"],
-}
-BUSINESS_CERT_UPLOAD_TYPES = ["pdf", "png", "jpg", "jpeg", "bmp", "webp"]
-BUSINESS_CERT_STOP_LABELS = [
-    "상호",
-    "법인명",
-    "단체명",
-    "사업자등록번호",
-    "성명",
-    "대표자",
-    "개업연월일",
-    "법인등록번호",
-    "사업장소재지",
-    "본점소재지",
-    "업태",
-    "종목",
-    "교부사유",
-    "발급사유",
-]
-INDUSTRY_GROUP_KEYWORDS = [
-    ("F", ["전기공사", "정보통신공사", "실내건축", "건설", "토목", "시공", "인테리어", "설비공사", "시설물유지", "배관공사"]),
-    ("J", ["소프트웨어", "정보통신", "시스템개발", "프로그램개발", "컴퓨터프로그래밍", "데이터", "플랫폼", "호스팅", "통신서비스", "it서비스", "sw"]),
-    ("C", ["제조업", "제조", "가공", "조립", "생산", "부품", "기계", "금속", "전자", "식품제조", "화장품제조"]),
-    ("G", ["도소매", "도매", "소매", "유통", "판매", "무역", "전자상거래", "상품중개"]),
-    ("M", ["엔지니어링", "컨설팅", "연구개발", "기술서비스", "설계", "시험분석", "광고대행", "디자인", "회계", "법무", "연구용역", "전문서비스"]),
-    ("N", ["사업지원", "시설관리", "경비", "청소", "인력공급", "근로자파견", "임대업", "렌탈", "콜센터", "여행사"]),
-    ("P", ["교육", "학원", "훈련", "연수", "평생교육"]),
-    ("S", ["수리업", "세탁", "미용", "협회", "단체", "개인서비스", "장례"]),
-    ("E", ["폐기물", "재활용", "하수", "수도", "정수", "원료재생", "환경복원"]),
-    ("D", ["전력", "발전업", "가스", "증기", "열공급", "에너지공급"]),
-    ("O", ["공공행정", "국방", "사회보장", "행정기관"]),
-]
-
-
-@st.cache_resource
-def get_ocr_engine():
-    return RapidOCR()
-
-
-def _normalize_ocr_token(text):
-    return re.sub(r"[^0-9A-Za-z가-힣]+", "", str(text or "")).strip().lower()
-
-
-def _format_business_id(value):
-    digits = re.sub(r"\D+", "", str(value or ""))
-    if len(digits) != 10:
-        return str(value or "").strip()
-    return f"{digits[:3]}-{digits[3:5]}-{digits[5:]}"
-
-
-def _trim_field_value(value):
-    text = re.sub(r"\s+", " ", str(value or "")).strip(" :,-")
-    text = re.sub(r"^(법인명|단체명|상호|대표자|사업장소재지|본점소재지|업태|종목)\s*", "", text).strip()
-    return text
-
-
-def _looks_like_label_line(line):
-    normalized = _normalize_ocr_token(line)
-    return any(_normalize_ocr_token(label) in normalized for label in BUSINESS_CERT_STOP_LABELS)
-
-
-def _render_pdf_bytes_to_images(file_bytes, page_limit=2):
-    temp_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_tmp_pdf_uploads")
-    os.makedirs(temp_dir, exist_ok=True)
-    tmp_path = None
-    images = []
-    try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf", dir=temp_dir) as handle:
-            handle.write(file_bytes)
-            tmp_path = handle.name
-        pdf = pdfium.PdfDocument(tmp_path)
-        try:
-            for page_idx in range(min(len(pdf), page_limit)):
-                pil_image = pdf[page_idx].render(scale=2.5).to_pil()
-                images.append(np.array(pil_image.convert("RGB")))
-        finally:
-            pdf.close()
-    finally:
-        if tmp_path and os.path.exists(tmp_path):
-            try:
-                os.remove(tmp_path)
-            except OSError:
-                pass
-    return images
-
-
-def _load_business_certificate_images(uploaded_file):
-    filename = str(getattr(uploaded_file, "name", "") or "").lower()
-    file_bytes = uploaded_file.getvalue()
-    if filename.endswith(".pdf"):
-        return _render_pdf_bytes_to_images(file_bytes)
-    image = Image.open(io.BytesIO(file_bytes)).convert("RGB")
-    return [np.array(image)]
-
-
-def _extract_pdf_text_lines(file_bytes, page_limit=2):
-    temp_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_tmp_pdf_uploads")
-    os.makedirs(temp_dir, exist_ok=True)
-    tmp_path = None
-    collected = []
-    try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf", dir=temp_dir) as handle:
-            handle.write(file_bytes)
-            tmp_path = handle.name
-        pdf = pdfium.PdfDocument(tmp_path)
-        try:
-            for page_idx in range(min(len(pdf), page_limit)):
-                page = pdf[page_idx]
-                text = (page.get_textpage().get_text_range() or "").replace("\x00", "")
-                if text.strip():
-                    collected.extend(line.strip() for line in text.splitlines() if line.strip())
-        finally:
-            pdf.close()
-    finally:
-        if tmp_path and os.path.exists(tmp_path):
-            try:
-                os.remove(tmp_path)
-            except OSError:
-                pass
-    return collected
-
-
-def _ocr_lines_from_image_array(image_array, y_tolerance=22):
-    result, _ = get_ocr_engine()(image_array)
-    tokens = []
-    for box, text, _score in result or []:
-        ys = [point[1] for point in box]
-        xs = [point[0] for point in box]
-        tokens.append((sum(ys) / len(ys), sum(xs) / len(xs), str(text)))
-    tokens.sort(key=lambda row: (row[0], row[1]))
-
-    grouped = []
-    for cy, cx, text in tokens:
-        if not grouped or abs(grouped[-1][0] - cy) > y_tolerance:
-            grouped.append([cy, [(cx, text)]])
-        else:
-            grouped[-1][1].append((cx, text))
-
-    lines = []
-    for _, items in grouped:
-        items.sort(key=lambda row: row[0])
-        line_text = " ".join(text for _, text in items).strip()
-        if line_text:
-            lines.append(line_text)
-    return lines
-
-
-def _extract_field_from_lines(lines, labels, *, join_following=False, max_follow_lines=2):
-    normalized_labels = [_normalize_ocr_token(label) for label in labels]
-    for idx, line in enumerate(lines):
-        normalized_line = _normalize_ocr_token(line)
-        if not any(label in normalized_line for label in normalized_labels):
-            continue
-
-        candidate = line
-        for label in labels:
-            candidate = re.sub(rf"{re.escape(label)}\s*[:：]?\s*", "", candidate, flags=re.IGNORECASE)
-        candidate = _trim_field_value(candidate)
-
-        extra_lines = []
-        next_idx = idx + 1
-        while next_idx < len(lines) and len(extra_lines) < max_follow_lines:
-            next_line = lines[next_idx].strip()
-            if not next_line or _looks_like_label_line(next_line):
-                break
-            extra_lines.append(next_line)
-            if not join_following:
-                break
-            next_idx += 1
-
-        if extra_lines:
-            if candidate:
-                candidate = f"{candidate} {' '.join(extra_lines)}"
-            else:
-                candidate = " ".join(extra_lines)
-
-        candidate = _trim_field_value(candidate)
-        if candidate:
-            return candidate
-    return ""
-
-
-def _extract_field_from_text(full_text, pattern, *, multiline=False):
-    flags = re.IGNORECASE | (re.DOTALL if multiline else 0)
-    match = re.search(pattern, full_text, flags)
-    if not match:
-        return ""
-    return _trim_field_value(re.sub(r"\s+", " ", match.group(1)).strip())
-
-
-def _is_noise_certificate_line(line):
-    normalized = _normalize_ocr_token(line)
-    if not normalized:
-        return True
-    noise_tokens = [
-        "ntsgokr",
-        "사업자등록증",
-        "간이과세자",
-        "세무서장",
-        "등록번호",
-        "발급사유",
-        "공동사업자",
-        "전자세금계산서",
-        "사업자단위과세",
-    ]
-    if any(token in normalized for token in noise_tokens):
-        return True
-    if re.search(r"\d{4}\s*년|\d{3}-?\d{2}-?\d{5}", line):
-        return True
-    return False
-
-
-def _infer_industry_group_from_text(*texts):
-    joined_text = " ".join(str(text or "") for text in texts)
-    normalized_text = _normalize_ocr_token(joined_text)
-    best_group = "M"
-    best_score = 0
-    best_keywords = []
-
-    for group_code, keywords in INDUSTRY_GROUP_KEYWORDS:
-        score = 0
-        matched = []
-        for keyword in keywords:
-            key = _normalize_ocr_token(keyword)
-            if key and key in normalized_text:
-                score += max(1, len(key) // 3)
-                matched.append(keyword)
-        if score > best_score:
-            best_group = group_code
-            best_score = score
-            best_keywords = matched
-
-    if best_keywords:
-        reason = f"사업자등록증 OCR 키워드 매칭: {', '.join(best_keywords[:4])}"
-        confidence = "high" if best_score >= 4 else "medium"
-    else:
-        reason = "명확한 업종 키워드가 없어 전문서비스(M) 기본값을 사용"
-        confidence = "low"
-
-    return {
-        "industry_group": best_group,
-        "industry_label": INDUSTRY_GROUP_LABELS.get(best_group, best_group),
-        "reason": reason,
-        "confidence": confidence,
-    }
-
-
-def extract_business_certificate_info(uploaded_file):
-    filename = str(getattr(uploaded_file, "name", "") or "").lower()
-    lines = []
-    if filename.endswith(".pdf"):
-        lines.extend(_extract_pdf_text_lines(uploaded_file.getvalue()))
-
-    if not lines:
-        images = _load_business_certificate_images(uploaded_file)
-        for image_array in images:
-            lines.extend(_ocr_lines_from_image_array(image_array))
-
-    full_text = "\n".join(lines)
-    business_id_match = re.search(r"\d{3}-?\d{2}-?\d{5}", full_text)
-    business_id = _format_business_id(business_id_match.group(0)) if business_id_match else ""
-    company_name = _extract_field_from_text(
-        full_text,
-        r"상\s*호\s*[:：]\s*([^\n]+)",
-    ) or _extract_field_from_lines(lines, ["상호", "법인명", "단체명", "상호명"])
-    location = _extract_field_from_text(
-        full_text,
-        r"(?:사\s*업\s*장\s*소\s*재\s*지|본\s*점\s*소\s*재\s*지)\s*[:：]\s*(.+?)(?=\n\s*(?:사\s*업\s*의\s*종\s*류|발\s*급\s*사\s*유|공\s*동\s*사\s*업\s*자|사업자\s*단위\s*과세|전자세금계산서)|$)",
-        multiline=True,
-    ) or _extract_field_from_lines(lines, ["사업장 소재지", "사업장소재지", "본점 소재지", "본점소재지", "소재지"], join_following=True)
-    business_type = _extract_field_from_text(
-        full_text,
-        r"업\s*태\s*([^\n]+)",
-    ) or _extract_field_from_lines(lines, ["업태"], join_following=False)
-    business_item = _extract_field_from_text(
-        full_text,
-        r"종\s*목\s*(.+?)(?=\n\s*(?:발\s*급\s*사\s*유|공\s*동\s*사\s*업\s*자|사업자\s*단위\s*과세|전자세금계산서)|$)",
-        multiline=True,
-    ) or _extract_field_from_lines(lines, ["종목"], join_following=True)
-
-    if not company_name:
-        line_candidates = [
-            line for line in lines
-            if 2 <= len(line.strip()) <= 40 and not _is_noise_certificate_line(line)
-        ]
-        company_name = line_candidates[0].strip() if line_candidates else ""
-
-    inference = _infer_industry_group_from_text(company_name, location, business_type, business_item, full_text)
-    summary_parts = []
-    if business_type:
-        summary_parts.append(f"업태: {business_type}")
-    if business_item:
-        summary_parts.append(f"종목: {business_item}")
-    if inference["industry_group"]:
-        summary_parts.append(f"추정 산업군: {inference['industry_label']} ({inference['industry_group']})")
-
-    return {
-        "company_name": company_name,
-        "business_id": business_id,
-        "location": location,
-        "business_type": business_type,
-        "business_item": business_item,
-        "industry_group": inference["industry_group"],
-        "industry_label": inference["industry_label"],
-        "industry_reason": inference["reason"],
-        "industry_confidence": inference["confidence"],
-        "summary_text": " / ".join(summary_parts),
-        "ocr_text": full_text,
-        "ocr_lines": lines,
-    }
-
-
-def _safe_upload_token(value):
-    text = re.sub(r"[^A-Za-z0-9._-]+", "_", str(value or "").strip())
-    return text.strip("._") or "upload"
-
-
-def _extract_excel_preview_text(file_bytes, max_rows=20):
-    snippets = []
-    try:
-        workbook = pd.ExcelFile(io.BytesIO(file_bytes))
-    except Exception:
-        return ""
-
-    for sheet_name in workbook.sheet_names[:4]:
-        try:
-            df = pd.read_excel(workbook, sheet_name=sheet_name, header=None, nrows=max_rows)
-        except Exception:
-            continue
-        flat_values = []
-        for value in df.fillna("").astype(str).values.flatten().tolist():
-            value = str(value).strip()
-            if value:
-                flat_values.append(value)
-        if flat_values:
-            snippets.append(" ".join(flat_values[:120]))
-    return "\n".join(snippets)
-
-
-@st.cache_data(show_spinner=False)
-def _extract_financial_preview_text_cached(filename: str, file_bytes: bytes):
-    filename = str(filename or "").lower()
-    file_bytes = file_bytes or b""
-    if filename.endswith(".pdf"):
-        lines = _extract_pdf_text_lines(file_bytes, page_limit=2)
-        if lines:
-            return "\n".join(lines[:80])
-        images = _render_pdf_bytes_to_images(file_bytes, page_limit=1)
-        ocr_lines = []
-        for image_array in images:
-            ocr_lines.extend(_ocr_lines_from_image_array(image_array))
-        return "\n".join(ocr_lines[:80])
-    return _extract_excel_preview_text(file_bytes)
-
-
-def _extract_financial_preview_text(uploaded_file):
-    filename = str(getattr(uploaded_file, "name", "") or "").lower()
-    file_bytes = uploaded_file.getvalue()
-    return _extract_financial_preview_text_cached(filename, file_bytes)
-
-
-def _normalize_statement_detection_text(text):
-    return re.sub(r"[^0-9A-Za-z가-힣]+", "", str(text or "")).lower()
-
-
-def _detect_financial_statement_type(uploaded_file):
-    filename = str(getattr(uploaded_file, "name", "") or "")
-    preview_text = _extract_financial_preview_text(uploaded_file)
-    combined_name = _normalize_statement_detection_text(filename)
-    combined_text = _normalize_statement_detection_text(preview_text)
-
-    best_type = None
-    best_score = 0
-    matched_keywords = []
-    for statement_type, keywords in FINANCIAL_STATEMENT_DETECTION_RULES.items():
-        score = 0
-        matched = []
-        for keyword in keywords:
-            token = _normalize_statement_detection_text(keyword)
-            if token and token in combined_name:
-                score += 5
-                matched.append(f"name:{keyword}")
-            if token and token in combined_text:
-                score += 3
-                matched.append(f"text:{keyword}")
-        if score > best_score:
-            best_type = statement_type
-            best_score = score
-            matched_keywords = matched
-
-    current_year = datetime.utcnow().year + 1
-    years = sorted(
-        {
-            str(year)
-            for year in re.findall(r"(19\d{2}|20\d{2}|21\d{2})", preview_text)
-            if 2000 <= int(year) <= current_year
-        },
-        reverse=True,
-    )
-
-    return {
-        "statement_type": best_type if best_score > 0 else None,
-        "score": best_score,
-        "matched_keywords": matched_keywords,
-        "preview_text": preview_text,
-        "years": years,
-        "filename": filename,
-    }
-
-
-def classify_financial_statement_uploads(uploaded_files):
-    uploaded_files = uploaded_files or []
-    selected_files = {}
-    details = []
-    duplicates = []
-    unclassified = []
-    detected_years = set()
-
-    for uploaded_file in uploaded_files:
-        detail = _detect_financial_statement_type(uploaded_file)
-        details.append(detail)
-        detected_years.update(detail.get("years", []))
-        statement_type = detail.get("statement_type")
-        if not statement_type:
-            unclassified.append(detail["filename"])
-            continue
-        current = selected_files.get(statement_type)
-        if current is None or detail["score"] > current["score"]:
-            if current is not None:
-                duplicates.append(current["filename"])
-            selected_files[statement_type] = {**detail, "uploaded_file": uploaded_file}
-        else:
-            duplicates.append(detail["filename"])
-
-    return {
-        "statement_files": {
-            statement_type: detail["uploaded_file"]
-            for statement_type, detail in selected_files.items()
-        },
-        "detected_map": {
-            statement_type: detail["filename"]
-            for statement_type, detail in selected_files.items()
-        },
-        "details": details,
-        "duplicates": duplicates,
-        "unclassified": unclassified,
-        "detected_years": sorted(detected_years, reverse=True),
-    }
-
-
-def _sanitize_classification_meta(classification_meta):
-    meta = dict(classification_meta or {})
-    return {
-        "detected_map": dict(meta.get("detected_map") or {}),
-        "details": list(meta.get("details") or []),
-        "duplicates": list(meta.get("duplicates") or []),
-        "unclassified": list(meta.get("unclassified") or []),
-        "detected_years": list(meta.get("detected_years") or []),
-    }
-
-
-def _json_default(value):
-    if isinstance(value, np.generic):
-        return value.item()
-    return str(value)
-
-
-def _safe_float_value(value: Any) -> Optional[float]:
-    if value in (None, ""):
-        return None
-    try:
-        return float(value)
-    except Exception:
-        return None
-
-
-class BufferedUpload:
-    def __init__(self, name: str, data: bytes):
-        self.name = str(name or "")
-        self._data = data or b""
-
-    def getvalue(self) -> bytes:
-        return self._data
-
-
-def _fast_upload_signature(upload_obj) -> str:
-    payload = upload_obj.getvalue() if upload_obj is not None else b""
-    payload = payload or b""
-    if len(payload) <= 8192:
-        sample = payload
-    else:
-        sample = payload[:4096] + payload[-4096:]
-    digest = hashlib.sha1(sample).hexdigest()
-    return f"{getattr(upload_obj, 'name', '')}:{len(payload)}:{digest}"
-
-
-def _latest_metric_ratio(
-    metric_df: pd.DataFrame,
-    industry_group: str,
-    period_key: str,
-    item_code: str,
-) -> Optional[float]:
-    if metric_df is None or metric_df.empty:
-        return None
-    filtered = metric_df[
-        (metric_df["industry_group"].astype(str) == str(industry_group))
-        & (metric_df["period_key"].astype(str) == str(period_key))
-        & (metric_df["item_code"].astype(str) == str(item_code))
-    ].copy()
-    if filtered.empty:
-        return None
-    filtered["created_at_sort"] = pd.to_datetime(filtered["created_at"], errors="coerce")
-    filtered = filtered.sort_values("created_at_sort")
-    return _safe_float_value(filtered.iloc[-1].get("value_pct"))
-
-
-def _latest_statement_amount(
-    statement_df: pd.DataFrame,
-    industry_group: str,
-    period_key: str,
-    account_code: str,
-    *,
-    absolute: bool = True,
-) -> Optional[float]:
-    if statement_df is None or statement_df.empty:
-        return None
-    filtered = statement_df[
-        (statement_df["industry_group"].astype(str) == str(industry_group))
-        & (statement_df["period_key"].astype(str) == str(period_key))
-        & (statement_df["normalized_account_code"].astype(str) == str(account_code))
-    ].copy()
-    if filtered.empty:
-        return None
-    filtered["ingested_at_sort"] = pd.to_datetime(filtered["ingested_at"], errors="coerce")
-    filtered = filtered.sort_values("ingested_at_sort")
-    value = _safe_float_value(filtered.iloc[-1].get("amount"))
-    if value is None:
-        return None
-    return abs(value) if absolute else value
-
-
-def _estimate_utilization(asset_turnover: Optional[float], cogs_ratio: Optional[float]) -> Optional[float]:
-    turnover = _safe_float_value(asset_turnover)
-    cogs = _safe_float_value(cogs_ratio)
-    if turnover is None and cogs is None:
-        return None
-
-    turnover_score = 0.72
-    if turnover is not None:
-        turnover_score = 0.55 + max(0.0, min(turnover, 2.0)) * 0.20
-
-    cogs_score = 0.72
-    if cogs is not None:
-        cogs_score = 0.60 + max(0.0, min(cogs, 0.95)) * 0.30
-
-    return max(0.55, min((turnover_score * 0.6) + (cogs_score * 0.4), 0.95))
-
-
-def _extract_financial_ratios_from_ingest(
-    workbook_path: str,
-    industry_group: str,
-    period_keys: List[str],
-    selected_period: Optional[str] = None,
-) -> Dict[str, Any]:
-    if not workbook_path or not os.path.exists(workbook_path):
-        return {}
-
-    sheets = load_industry_db(workbook_path)
-    statement_df = sheets.get("statement_rows", pd.DataFrame())
-    metric_df = sheets.get("metric_observations", pd.DataFrame())
-    normalized_periods = [str(period) for period in period_keys if str(period).strip()]
-    if not normalized_periods:
-        return {}
-
-    current_period = str(selected_period).strip() if str(selected_period or "").strip() in normalized_periods else next((period for period in normalized_periods if str(period).isdigit()), normalized_periods[0])
-    previous_period = None
-    for candidate in normalized_periods:
-        if candidate != current_period:
-            previous_period = candidate
-            break
-
-    ratios: Dict[str, Any] = {
-        "selected_period": current_period,
-        "previous_period": previous_period,
-    }
-
-    metric_ratio_map = {
-        "observed_material_ratio": "material",
-        "observed_labor_ratio": "labor",
-        "observed_expense_ratio": "expense",
-        "observed_gna_ratio": "gna",
-        "observed_profit_ratio": "profit",
-        "observed_rnd_ratio": "rnd",
-    }
-    for target_key, item_code in metric_ratio_map.items():
-        metric_value = _latest_metric_ratio(metric_df, industry_group, current_period, item_code)
-        if metric_value is not None:
-            ratios[target_key] = metric_value / 100.0
-
-    sales_revenue = _latest_statement_amount(statement_df, industry_group, current_period, "is_revenue")
-    operating_profit = _latest_statement_amount(statement_df, industry_group, current_period, "is_operating_profit", absolute=False)
-    total_assets = _latest_statement_amount(statement_df, industry_group, current_period, "bs_total_assets")
-    cogs_amount = _latest_statement_amount(statement_df, industry_group, current_period, "is_cogs")
-    employee_benefits = _latest_statement_amount(statement_df, industry_group, current_period, "is_employee_benefits")
-    direct_labor_amount = _latest_statement_amount(statement_df, industry_group, current_period, "cost_labor")
-
-    if sales_revenue:
-        ratios["sales_revenue"] = float(sales_revenue)
-    if sales_revenue and operating_profit is not None:
-        ratios["operating_margin"] = float(operating_profit) / float(sales_revenue)
-    if sales_revenue and total_assets:
-        ratios["asset_turnover"] = float(sales_revenue) / float(total_assets)
-
-    cogs_ratio = None
-    if sales_revenue and cogs_amount is not None:
-        cogs_ratio = float(cogs_amount) / float(sales_revenue)
-    else:
-        direct_sum = sum(
-            float(ratios.get(key, 0.0) or 0.0)
-            for key in ("observed_material_ratio", "observed_labor_ratio", "observed_expense_ratio")
-        )
-        if direct_sum > 0:
-            cogs_ratio = direct_sum
-    if cogs_ratio is not None:
-        ratios["cogs_ratio"] = cogs_ratio
-
-    if employee_benefits and direct_labor_amount and direct_labor_amount > 0:
-        burden_candidate = (float(employee_benefits) - float(direct_labor_amount)) / float(direct_labor_amount)
-        ratios["labor_burden_rate"] = max(0.05, min(burden_candidate, 1.20))
-    elif ratios.get("observed_labor_ratio") is not None:
-        ratios["labor_burden_rate"] = 0.30
-
-    estimated_utilization = _estimate_utilization(ratios.get("asset_turnover"), ratios.get("cogs_ratio"))
-    if estimated_utilization is not None:
-        ratios["estimated_utilization"] = estimated_utilization
-
-    previous_revenue = None
-    previous_operating_profit = None
-    if previous_period:
-        previous_revenue = _latest_statement_amount(statement_df, industry_group, previous_period, "is_revenue")
-        previous_operating_profit = _latest_statement_amount(statement_df, industry_group, previous_period, "is_operating_profit", absolute=False)
-
-    if sales_revenue and previous_revenue:
-        ratios["sales_growth_yoy"] = ((float(sales_revenue) / float(previous_revenue)) - 1.0) * 100.0
-    if sales_revenue and previous_revenue and operating_profit is not None and previous_operating_profit is not None:
-        current_margin = float(operating_profit) / float(sales_revenue)
-        previous_margin = float(previous_operating_profit) / float(previous_revenue)
-        ratios["op_margin_delta_yoy"] = (current_margin - previous_margin) * 100.0
-
-    return ratios
-
-
-def _prepare_uploaded_supplier_reference(
-    company_name,
-    industry_group,
-    uploaded_statement_files,
-    business_info=None,
-    statement_period_candidates=None,
-    classification_meta=None,
-):
-    if not industry_group:
-        raise ValueError("사업자등록증 OCR로 산업군을 추정하지 못했습니다. 등록증 이미지를 다시 확인해 주세요.")
-    if not uploaded_statement_files:
-        raise ValueError("재무제표 파일을 1개 이상 업로드해 주세요.")
-
-    base_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_tmp_uploaded_financial_refs")
-    os.makedirs(base_dir, exist_ok=True)
-    sanitized_classification_meta = _sanitize_classification_meta(classification_meta)
-    cache_payload = {
-        "company_name": str(company_name or "").strip(),
-        "industry_group": str(industry_group or "").strip().upper(),
-        "statement_period_candidates": sorted(str(year) for year in (statement_period_candidates or [])),
-        "files": [
-            {
-                "statement_type": statement_type,
-                "signature": _fast_upload_signature(uploaded_file),
-            }
-            for statement_type, uploaded_file in sorted((uploaded_statement_files or {}).items())
-            if uploaded_file is not None
-        ],
-    }
-    run_token = hashlib.sha1(
-        json.dumps(cache_payload, ensure_ascii=False, sort_keys=True, default=_json_default).encode("utf-8")
-    ).hexdigest()[:12]
-    work_dir = os.path.join(base_dir, run_token)
-    os.makedirs(work_dir, exist_ok=True)
-    cache_meta_path = os.path.join(work_dir, "reference_ctx.json")
-    workbook_path = os.path.join(work_dir, "uploaded_supplier_financial_db.xlsx")
-
-    if os.path.exists(cache_meta_path) and os.path.exists(workbook_path):
-        try:
-            with open(cache_meta_path, "r", encoding="utf-8") as handle:
-                cached_ctx = json.load(handle)
-            cached_ctx["industry_reason"] = (business_info or {}).get("industry_reason", cached_ctx.get("industry_reason", ""))
-            cached_ctx["industry_confidence"] = (business_info or {}).get("industry_confidence", cached_ctx.get("industry_confidence", ""))
-            cached_ctx["classification_meta"] = sanitized_classification_meta
-            cached_ctx["workbook_path"] = workbook_path
-            return cached_ctx
-        except Exception:
-            pass
-
-    saved_paths = {}
-    source_names = {}
-    for statement_type, uploaded_file in uploaded_statement_files.items():
-        if uploaded_file is None:
-            continue
-        original_name = os.path.basename(getattr(uploaded_file, "name", "") or f"{statement_type.lower()}.pdf")
-        ext = os.path.splitext(original_name)[1].lower() or ".pdf"
-        safe_name = f"{statement_type.lower()}_{_safe_upload_token(os.path.splitext(original_name)[0])}{ext}"
-        target_path = os.path.join(work_dir, safe_name)
-        with open(target_path, "wb") as handle:
-            handle.write(uploaded_file.getvalue())
-        saved_paths[statement_type] = target_path
-        source_names[statement_type] = original_name
-
-    ensure_workbook(workbook_path)
-
-    rows_written = 0
-    restatement_detected = False
-    mode = "estimated_partial"
-    fallback_note = ""
-    period_keys = []
-
-    if all(statement_type in saved_paths for statement_type in FINANCIAL_REQUIRED_UPLOADS):
-        ingest_result = ingest_industry_statements(
-            industry_group,
-            f"manual_upload_{datetime.utcnow().strftime('%Y%m%d%H%M%S')}",
-            saved_paths,
-            workbook_path=workbook_path,
-        )
-        period_keys = sorted(
-            {str(period_key) for period_key in ingest_result.get("period_keys", [])},
-            reverse=True,
-        )
-        rows_written = int(ingest_result.get("rows_written", 0) or 0)
-        restatement_detected = bool(ingest_result.get("restatement_detected"))
-        mode = "uploaded_observed"
-        fallback_note = "재무상태표/손익계산서/현금흐름표를 모두 인식해 실측 재무기준으로 분석합니다."
-    else:
-        current_year = datetime.utcnow().year + 1
-        candidate_years = sorted(
-            {
-                str(year)
-                for year in (statement_period_candidates or [])
-                if str(year).isdigit() and 2000 <= int(str(year)) <= current_year
-            },
-            reverse=True,
-        )
-        selected_year = next((year for year in candidate_years if year.isdigit()), str(datetime.utcnow().year - 1))
-        build_estimated_industry_baseline(
-            industry_group,
-            selected_year,
-            workbook_path=workbook_path,
-        )
-        period_keys = [selected_year]
-        fallback_note = (
-            f"부분 재무제표 업로드({', '.join(sorted(saved_paths.keys()))})로 인해 "
-            "업종 추정 기반의 보수적 기준을 사용합니다."
-        )
-
-    if not period_keys:
-        raise ValueError("업로드한 재무자료에서 분석 기준 연도를 찾지 못했습니다.")
-
-    selected_period = next((key for key in period_keys if key.isdigit()), period_keys[0])
-    preview_items = get_baseline_items(
-        industry_group,
-        selected_period,
-        workbook_path=workbook_path,
-    )
-    financial_ratios = _extract_financial_ratios_from_ingest(
-        workbook_path,
-        str(industry_group).strip().upper(),
-        period_keys,
-        selected_period=selected_period,
-    )
-
-    reference_ctx = {
-        "company_name": str(company_name or "").strip(),
-        "industry_group": str(industry_group).strip().upper(),
-        "industry_label": INDUSTRY_GROUP_LABELS.get(str(industry_group).strip().upper(), str(industry_group).strip().upper()),
-        "industry_reason": (business_info or {}).get("industry_reason", ""),
-        "industry_confidence": (business_info or {}).get("industry_confidence", ""),
-        "workbook_path": workbook_path,
-        "period_keys": period_keys,
-        "selected_period": selected_period,
-        "preview_items": preview_items,
-        "uploaded_files": source_names,
-        "uploaded_summary": ", ".join(f"{key}={value}" for key, value in source_names.items()),
-        "rows_written": rows_written,
-        "restatement_detected": restatement_detected,
-        "available_statement_types": sorted(saved_paths.keys()),
-        "mode": mode,
-        "fallback_note": fallback_note,
-        "financial_ratios": financial_ratios,
-        "classification_meta": sanitized_classification_meta,
-    }
-    try:
-        with open(cache_meta_path, "w", encoding="utf-8") as handle:
-            json.dump(reference_ctx, handle, ensure_ascii=False, indent=2, default=_json_default)
-    except Exception:
-        pass
-    return reference_ctx
-
-
-def build_financial_forensic_context(
-    supplier_reference_ctx: Optional[Dict[str, Any]],
-    should_cost_result: Optional[Dict[str, Any]] = None,
-) -> str:
-    if not supplier_reference_ctx:
-        return ""
-
-    financial_ratios = supplier_reference_ctx.get("financial_ratios", {}) or {}
-    mode = supplier_reference_ctx.get("mode", "estimated_partial")
-    company = supplier_reference_ctx.get("company_name") or "협력사"
-    industry = supplier_reference_ctx.get("industry_label", supplier_reference_ctx.get("industry_group", ""))
-    period = supplier_reference_ctx.get("selected_period", "")
-    quality_label = "실측 재무기준" if mode == "uploaded_observed" else "업종 추정기준(프록시)"
-
-    lines = [
-        f"[협력사 재무 분석 컨텍스트 — {company} / {industry} / {period}]",
-        f"  • 데이터 품질: {quality_label}",
-    ]
-
-    ratio_lines = [
-        ("observed_labor_ratio", "재무제표 관측 인건비 비율"),
-        ("observed_gna_ratio", "재무제표 관측 일반관리비 비율"),
-        ("observed_profit_ratio", "재무제표 관측 영업이익률"),
-        ("cogs_ratio", "재무제표 관측 매출원가율"),
-    ]
-    for key, label in ratio_lines:
-        value = _safe_float_value(financial_ratios.get(key))
-        if value is not None:
-            lines.append(f"  • {label}: {value * 100:.1f}%")
-
-    sales_revenue = _safe_float_value(financial_ratios.get("sales_revenue"))
-    if sales_revenue is not None:
-        lines.append(f"  • 최근 매출액: {sales_revenue:,.0f}원")
-
-    sales_growth_yoy = _safe_float_value(financial_ratios.get("sales_growth_yoy"))
-    if sales_growth_yoy is not None:
-        sign = "+" if sales_growth_yoy >= 0 else ""
-        lines.append(f"  • 전년 대비 매출 성장률(YoY): {sign}{sales_growth_yoy:.1f}%")
-
-    op_margin_delta_yoy = _safe_float_value(financial_ratios.get("op_margin_delta_yoy"))
-    if op_margin_delta_yoy is not None:
-        sign = "+" if op_margin_delta_yoy >= 0 else ""
-        lines.append(f"  • 영업이익률 변화(YoY): {sign}{op_margin_delta_yoy:.1f}%p")
-
-    asset_turnover = _safe_float_value(financial_ratios.get("asset_turnover"))
-    if asset_turnover is not None:
-        lines.append(f"  • 자산회전율: {asset_turnover:.2f}x")
-
-    estimated_utilization = _safe_float_value(financial_ratios.get("estimated_utilization"))
-    if estimated_utilization is not None:
-        lines.append(f"  • 추정 가동률: {estimated_utilization * 100:.1f}%")
-
-    if should_cost_result:
-        utilization_gap = _safe_float_value(should_cost_result.get("utilization_gap"))
-        if utilization_gap is not None and utilization_gap > 0:
-            current_util = 0.85 - utilization_gap
-            unit_save = float(should_cost_result.get("unit_cost_saving_pct", 0.0) or 0.0) * 100.0
-            lines.append(
-                f"  • 가동률 분석: 추정 가동률 {current_util * 100:.0f}%, 85% Sweet-Spot 달성 시 단위원가 {unit_save:.1f}% 절감 여력"
-            )
-
-    strategy_hints: List[str] = []
-    if float(financial_ratios.get("observed_profit_ratio", 0.0) or 0.0) > 0.15:
-        strategy_hints.append("영업이익률이 15%를 초과해 과도한 이윤 마진 협상 근거를 확보할 수 있습니다.")
-    if float(financial_ratios.get("observed_labor_ratio", 0.0) or 0.0) > 0.65:
-        strategy_hints.append("노무비 비중이 65%를 초과해 자동화 수준과 효율화 여지를 질의할 수 있습니다.")
-    if _safe_float_value(financial_ratios.get("sales_growth_yoy")) is not None and float(financial_ratios.get("sales_growth_yoy", 0.0)) < -5.0:
-        strategy_hints.append("매출 역성장이 뚜렷해 당사 주문 의존도 기반 가격 협상력을 확보할 수 있습니다.")
-    if strategy_hints:
-        lines.append("  • 재무 기반 협상 레버리지:")
-        for hint in strategy_hints:
-            lines.append(f"    - {hint}")
-
-    return "\n".join(lines)
-
-
-def build_quick_industry_reference_ctx(
-    company_name: str,
-    business_info: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
-    business_info = business_info or {}
-    industry_group = str(business_info.get("industry_group") or "").strip().upper()
-    if not industry_group:
-        raise ValueError("빠른 분석을 하려면 먼저 사업자등록증을 업로드해 산업군을 자동 추정해 주세요.")
-
-    base_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_tmp_uploaded_financial_refs")
-    os.makedirs(base_dir, exist_ok=True)
-    work_dir = os.path.join(base_dir, "quick_analysis")
-    os.makedirs(work_dir, exist_ok=True)
-    workbook_path = os.path.join(work_dir, "quick_industry_baseline.xlsx")
-    ensure_workbook(workbook_path)
-
-    selected_year = str(datetime.utcnow().year - 1)
-    build_estimated_industry_baseline(industry_group, selected_year, workbook_path=workbook_path)
-    preview_items = get_baseline_items(industry_group, selected_year, workbook_path=workbook_path)
-    financial_ratios = _extract_financial_ratios_from_ingest(
-        workbook_path,
-        industry_group,
-        [selected_year],
-        selected_period=selected_year,
-    )
-
-    return {
-        "company_name": str(company_name or "").strip(),
-        "industry_group": industry_group,
-        "industry_label": INDUSTRY_GROUP_LABELS.get(industry_group, industry_group),
-        "industry_reason": business_info.get("industry_reason", ""),
-        "industry_confidence": business_info.get("industry_confidence", ""),
-        "workbook_path": workbook_path,
-        "period_keys": [selected_year],
-        "selected_period": selected_year,
-        "preview_items": preview_items,
-        "uploaded_files": {},
-        "uploaded_summary": "업종 기본 기준(빠른 분석)",
-        "rows_written": 0,
-        "restatement_detected": False,
-        "available_statement_types": [],
-        "mode": "quick_industry_proxy",
-        "fallback_note": "재무제표 기준 없이, 사업자등록증 기반 업종 기본 기준으로 빠른 분석을 수행합니다.",
-        "financial_ratios": financial_ratios,
-        "classification_meta": {"quick_analysis": True},
-    }
-
-
 # ==============================================================================
 # [NEW 핵심 패치 7] PC 계정명 불일치 및 OneDrive 경로 문제 지능형 탐색 패치 (Additive)
 # ==============================================================================
@@ -1337,35 +393,12 @@ for _path in _candidate_paths:
         break
 # ==============================================================================
 
-def get_exaone_runtime_error() -> str:
-    missing_modules = [
-        module_name
-        for module_name in ("torch", "transformers")
-        if importlib.util.find_spec(module_name) is None
-    ]
-    if not missing_modules:
-        return ""
-
-    module_list = ", ".join(missing_modules)
-    return (
-        f"EXAONE 로컬 보고서 생성에 필요한 패키지가 설치되어 있지 않습니다: {module_list}\n"
-        f"설치 예시: pip install {' '.join(missing_modules)}"
-    )
-
-
-def safe_rerun():
-    st.rerun()
-
 @st.cache_resource
 def load_exaone_local(model_path):
     """웹 페이지 로딩이 끝난 뒤, 사용자가 'AI 버튼'을 누르는 순간에만 최초 1회 로딩됩니다.
     경로를 매개변수로 받아 유연성을 극대화합니다."""
     try:
         import os
-        dependency_error = get_exaone_runtime_error()
-        if dependency_error:
-            return None, None, dependency_error
-
         # 윈도우 경로(\)를 HuggingFace가 Repo ID로 오인하는 버그 원천 차단
         safe_model_path = os.path.abspath(model_path).replace('\\', '/')
         
@@ -1409,42 +442,12 @@ def load_exaone_local(model_path):
 
 HAS_LLM = True 
 device_info = "On-Demand (지연 로딩 및 실시간 스트리밍 대기 중)"
-EXAONE_SYSTEM_PROMPT = """당신은 구매 재무 분석 전문가(Procurement Forensic Analyst)입니다.
-## 핵심 분석 스킬
-1. 재무제표 역산(Financial Reverse Engineering): BS/IS/CF 간 유기적 연관성을 이용해
-   협력사의 실제 원가 구조(노무비/재료비/제조경비)를 역산합니다.
-2. Should-Cost vs Will-Cost 분석: 상향식(Bottom-up) 원가 추정과 협력사 제출가의
-   Gap을 계량적으로 제시합니다.
-3. 가동률 Sweet-Spot(85%) 기준 What-if 시뮬레이션: 가동률 개선 시 단위원가 절감
-   여력을 수치로 제시합니다.
-4. TCO(총소유비용) 관점: 단순 단가가 아닌 물류/품질/결제조건을 포괄합니다.
-## 출력 구조 (반드시 준수)
-### 1. 비목 적정성 판정 요약
-| 비목 | 협력사 제출 비중 | 재무 기준 | 판정 | 핵심 근거 |
-|------|----------------|----------|------|---------|
-### 2. 재무 역산 기반 Should-Cost 분석
-- 협력사 재무제표에서 역산된 실제 원가 구조를 서술
-- 가동률/노동부담률/COGM 역산 결과 포함
-### 3. 비목별 협상 전략 (3가지 시나리오)
-#### 3-1. 공격형 (Gap 최대화)
-#### 3-2. 방어형 (리스크 최소화)
-#### 3-3. 상생형 (JCR/장기 파트너십)
-### 4. 협상 실행 스크립트 (말하기 예시)
-- 구체적인 발화 예시는 반드시 큰따옴표로 제시
-### 5. 비가격적 가치 확보 방안
-- 결제 조건, Price Freeze, 무상 검사 등
-수치는 반드시 원 단위까지 구체적으로 제시하고, 추상적 서술을 지양합니다."""
 
 # ==============================================================================
 # 저사양 PC를 위한 실시간 스트리밍 제너레이터 구현 (방화벽 타임아웃 100% 방지)
 # ==============================================================================
 def ask_exaone_stream(prompt_text, user_defined_model_path):
     import gc
-    dependency_error = get_exaone_runtime_error()
-    if dependency_error:
-        yield f"⚠️ {dependency_error}"
-        return
-
     import torch
     
     # [메모리 다이어트 1] AI 구동 직전, 메모리에 쌓인 불필요한 찌꺼기를 강제로 모두 비워냅니다 (8GB RAM 방어)
@@ -1463,12 +466,11 @@ def ask_exaone_stream(prompt_text, user_defined_model_path):
         import threading
 
         # [하드웨어 스로틀링] 저사양 CPU 환경에서 PC 전체가 다운되는 현상 방지
-        is_cpu_generation = ai_model.device.type == 'cpu'
-        if is_cpu_generation:
+        if ai_model.device.type == 'cpu':
             torch.set_num_threads(2)
 
         messages = [
-            {"role": "system", "content": EXAONE_SYSTEM_PROMPT},
+            {"role": "system", "content": "당신은 전문 구매 협상가입니다. 논리적이고 명확하게 답변하세요."},
             {"role": "user", "content": prompt_text}
         ]
         
@@ -1486,17 +488,13 @@ def ask_exaone_stream(prompt_text, user_defined_model_path):
         generation_kwargs = dict(
             input_ids=inputs["input_ids"], 
             attention_mask=inputs.get("attention_mask", None),
-            max_new_tokens=1024 if is_cpu_generation else 1536,
+            max_new_tokens=2048,  # 리포트 끊김 방지를 위해 최대 생성 가능 토큰 수 2048로 대폭 증가
             eos_token_id=tokenizer.eos_token_id,
-            pad_token_id=tokenizer.eos_token_id,
-            do_sample=not is_cpu_generation,
-            use_cache=True,
-            repetition_penalty=1.03,
+            do_sample=True,      
+            temperature=0.7,     
+            top_p=0.9,
             streamer=streamer # 스트리머 연결
         )
-        if not is_cpu_generation:
-            generation_kwargs["temperature"] = 0.7
-            generation_kwargs["top_p"] = 0.9
         
         # [메모리 다이어트 2] torch.inference_mode()를 통해 AI 생성 시 메모리를 잡아먹는 백그라운드 추적 기능을 완벽히 끕니다.
         def _generate_with_mem_clear():
@@ -1591,10 +589,7 @@ class LocalHybridSearchEngine:
         stale = [c for c in candidates if c.get("fingerprint", "") in recent]
         return fresh + stale
 
-    def clear_fingerprints(self):
-        self._recent_fingerprints = []
-
-    def _remember_fingerprint(self, fingerprint: str, max_recent: int = 50):
+    def _remember_fingerprint(self, fingerprint: str, max_recent: int = 20):
         if not fingerprint:
             return
         if fingerprint in self._recent_fingerprints:
@@ -2598,14 +1593,6 @@ class CategoryAnalysisEngine:
 
         return self._apply_total_cap(capped, vendor_total)
 
-    def _build_financial_ratio_reference_amounts(self, quote_amounts, adequacy_rows):
-        vendor_total = float(quote_amounts.get('total', 0.0) or 0.0)
-        reference_amounts = {}
-        for item_code in ['labor', 'material', 'expense', 'gna', 'profit', 'rnd']:
-            reference_amounts[item_code] = self._baseline_target_amount(adequacy_rows, item_code, vendor_total)
-        reference_amounts['total'] = sum(reference_amounts.values())
-        return reference_amounts
-
     def _cap_internal_amount(self, item_code, candidate_amount, quote_amounts, adequacy_rows):
         candidate = float(candidate_amount or 0.0)
         if candidate <= 0:
@@ -2659,105 +1646,14 @@ class CategoryAnalysisEngine:
                 settlement[item_code] = target_amount
         return settlement
 
-    def _build_target_policy_notes(self, category_context, internal_amounts, reference_amounts, reference_mode=""):
+    def _build_target_policy_notes(self, category_context, internal_amounts, reference_amounts):
         primary_category = category_context.get('primary_category', '-')
-        if reference_mode == "uploaded_observed":
-            basis_note = "당사 목표는 협력사 업로드 재무제표에서 산출한 비목 Base 비율을 1차 기준점으로 사용했습니다."
-        elif reference_mode == "estimated_partial":
-            basis_note = "당사 목표는 일부 업로드 재무자료를 우선 반영하고, 부족한 항목만 업종 추정 기준으로 보완했습니다."
-        elif reference_mode == "quick_industry_proxy":
-            basis_note = "당사 목표는 빠른 분석용 업종 프록시 기준을 사용했습니다."
-        else:
-            basis_note = "당사 목표는 standard_db 직접비와 업로드 재무기준 비목 비율을 우선 사용하되, 협력사 제출액과 기준 상단 범위를 넘지 않도록 자동 상한을 적용했습니다."
         return [
             f"원가 체계는 {primary_category} 기준으로 자동 인식했습니다.",
-            basis_note,
+            "당사 목표는 standard_db 직접비와 산업 baseline 비목 비율을 우선 사용하되, 협력사 제출액과 baseline 상단 범위를 넘지 않도록 자동 상한을 적용했습니다.",
             f"표준 노무비 기준: {float(reference_amounts.get('labor', 0.0)):,.0f}원" if reference_amounts.get('labor') else "표준 노무비가 없어 협력사 제출 노무비를 기준으로 사용했습니다.",
             f"자동 산정 내부 목표 합계: {sum(float(v) for v in internal_amounts.values()):,.0f}원",
         ]
-
-    def compute_should_cost(self, financial_ratios, quote_amounts, context_text=""):
-        ratios = financial_ratios or {}
-        v_total = float(quote_amounts.get("total", 0.0) or 0.0)
-        if v_total <= 0:
-            return {}
-
-        result: Dict[str, Any] = {}
-        observed_labor_ratio = _safe_float_value(ratios.get("observed_labor_ratio"))
-        if observed_labor_ratio is not None and observed_labor_ratio > 0:
-            labor_total_should = v_total * observed_labor_ratio
-            burden_rate = _safe_float_value(ratios.get("labor_burden_rate"))
-            if burden_rate is None or burden_rate < 0:
-                burden_rate = 0.30
-            burden_rate = max(0.0, min(burden_rate, 1.50))
-            direct_labor_should = labor_total_should / (1.0 + burden_rate)
-            indirect_labor_should = labor_total_should - direct_labor_should
-            result["direct_labor_should"] = direct_labor_should
-            result["indirect_labor_should"] = indirect_labor_should
-            result["labor_burden_rate"] = burden_rate
-
-        utilization = _safe_float_value(ratios.get("estimated_utilization"))
-        sweet_spot = 0.85
-        if utilization is not None:
-            utilization = max(0.0, min(utilization, 1.0))
-            if utilization < sweet_spot:
-                fixed_cost_reduction = 1.0 - (utilization / sweet_spot)
-                result["utilization_gap"] = sweet_spot - utilization
-                result["fixed_cost_reduction_pct"] = fixed_cost_reduction
-                result["unit_cost_saving_pct"] = fixed_cost_reduction * 0.60
-            else:
-                result["utilization_gap"] = 0.0
-                result["fixed_cost_reduction_pct"] = 0.0
-                result["unit_cost_saving_pct"] = 0.0
-
-        cogs_ratio = _safe_float_value(ratios.get("cogs_ratio"))
-        if cogs_ratio is not None and cogs_ratio > 0:
-            cogs_ratio = max(0.0, min(cogs_ratio, 1.0))
-            result["estimated_cogm"] = v_total * cogs_ratio
-            result["estimated_gross_margin"] = v_total * (1.0 - cogs_ratio)
-            result["cogs_ratio"] = cogs_ratio
-
-        if ("비상주" in context_text or "원격" in context_text) and result.get("direct_labor_should"):
-            travel_factor = 0.10
-            result["travel_expense_add"] = result["direct_labor_should"] * travel_factor
-
-        return result
-
-    def build_should_cost_summary(self, should_cost_result, quote_amounts):
-        sc = should_cost_result or {}
-        if not sc:
-            return ""
-
-        lines = ["[Should-Cost 역산 분석 (재무제표 기반)]"]
-        direct_labor_should = _safe_float_value(sc.get("direct_labor_should"))
-        indirect_labor_should = _safe_float_value(sc.get("indirect_labor_should"))
-        burden_rate = _safe_float_value(sc.get("labor_burden_rate"))
-        if direct_labor_should is not None:
-            lines.append(f"  • 재무제표 역산 적정 직접노무비: {direct_labor_should:,.0f}원")
-        if indirect_labor_should is not None and burden_rate is not None:
-            lines.append(f"  • 적정 간접노무비(부담률 {burden_rate * 100:.0f}%): {indirect_labor_should:,.0f}원")
-
-        utilization_gap = _safe_float_value(sc.get("utilization_gap"))
-        unit_cost_saving_pct = _safe_float_value(sc.get("unit_cost_saving_pct"))
-        if utilization_gap is not None and utilization_gap > 0:
-            current_utilization = 0.85 - utilization_gap
-            lines.append(
-                f"  • 추정 가동률: {current_utilization * 100:.0f}% (Sweet-Spot 85% 대비 {utilization_gap * 100:.1f}%p 부족)"
-            )
-        if unit_cost_saving_pct is not None and unit_cost_saving_pct > 0:
-            lines.append(f"  • 가동률 개선 시 단위원가 절감 여력: {unit_cost_saving_pct * 100:.1f}%")
-
-        estimated_cogm = _safe_float_value(sc.get("estimated_cogm"))
-        cogs_ratio = _safe_float_value(sc.get("cogs_ratio"))
-        if estimated_cogm is not None:
-            cogs_ratio_text = f" ({cogs_ratio * 100:.1f}%)" if cogs_ratio is not None else ""
-            lines.append(f"  • 추정 COGM: {estimated_cogm:,.0f}원{cogs_ratio_text}")
-
-        travel_expense_add = _safe_float_value(sc.get("travel_expense_add"))
-        if travel_expense_add is not None and travel_expense_add > 0:
-            lines.append(f"  • 비상주/원격 보정 출장비 가산 추정: {travel_expense_add:,.0f}원")
-
-        return "\n".join(lines)
 
     def _analyze_legacy(self, df_input, ui_category, user_targets, context_text="", analysis_meta=None):
         validation_errors = DataValidator.validate_estimate_data(df_input)
@@ -2951,12 +1847,6 @@ class CategoryAnalysisEngine:
         )
 
         quote_amounts = adequacy_report.get('quote_amounts', {})
-        financial_ratios = dict((analysis_meta or {}).get("financial_ratios") or {})
-        reference_mode = str((analysis_meta or {}).get("reference_mode") or "")
-        reference_source_label = str((analysis_meta or {}).get("reference_source_label") or "").strip()
-        use_uploaded_financial_reference = reference_mode == "uploaded_observed"
-        should_cost_result = self.compute_should_cost(financial_ratios, quote_amounts, context_text)
-        should_cost_summary = self.build_should_cost_summary(should_cost_result, quote_amounts)
         standard_reference = self._build_standard_reference(
             df_input,
             category_context=category_context,
@@ -2964,18 +1854,11 @@ class CategoryAnalysisEngine:
         )
         v_total = float(quote_amounts.get('total', df_input['금액'].sum()))
         adequacy_rows = {row['item']: row for row in adequacy_report.get('item_rows', [])}
-        if use_uploaded_financial_reference:
-            reference_amounts = self._cap_reference_amounts(
-                quote_amounts,
-                self._build_financial_ratio_reference_amounts(quote_amounts, adequacy_rows),
-                adequacy_rows,
-            )
-        else:
-            reference_amounts = self._cap_reference_amounts(
-                quote_amounts,
-                standard_reference.get('amounts', {}),
-                adequacy_rows,
-            )
+        reference_amounts = self._cap_reference_amounts(
+            quote_amounts,
+            standard_reference.get('amounts', {}),
+            adequacy_rows,
+        )
 
         internal_amounts = self._derive_internal_target_amounts(
             quote_amounts,
@@ -2989,54 +1872,7 @@ class CategoryAnalysisEngine:
             category_context,
             internal_amounts,
             reference_amounts,
-            reference_mode=reference_mode,
         )
-        if use_uploaded_financial_reference and reference_source_label:
-            target_policy_notes.insert(1, f"기준 출처: {reference_source_label}")
-
-        if use_uploaded_financial_reference:
-            cost_reference_note = (
-                "공시기준가 열은 협력사 업로드 재무제표에서 산출한 비목 Base 비율을 견적 총액에 적용해 만든 기준 금액입니다. "
-                "노무비·재료비·간접비 모두 협력사 실측 재무기준을 1차 기준으로 사용하고, 협력사 제출액과 업로드 재무기준 상단 범위를 넘지 않도록 자동 상한을 적용합니다. "
-                "Base와 협력사 제출 실제 비중의 차이가 15%p 이상이면 예외보정으로 협력사 제출/당사 목표 평균값을 사용합니다."
-            )
-            cost_reference_coverage = (
-                f"{reference_source_label} 기준 Base 비율 × 견적 총액"
-                if reference_source_label
-                else "협력사 업로드 재무제표 기준 Base 비율 × 견적 총액"
-            )
-            cost_reference_notes = []
-            if reference_source_label:
-                cost_reference_notes.append(f"기준 출처: {reference_source_label}")
-            cost_reference_notes.append("비목 기준점은 업종 평균이 아니라 협력사 재무제표에서 복원한 Base 비율입니다.")
-        elif reference_mode == "estimated_partial":
-            cost_reference_note = (
-                "공시기준가 열은 일부 업로드 재무자료를 우선 반영하되, 부족한 항목은 업종 추정 기준과 standard_db 직접비를 보조적으로 사용해 산출한 참조 금액입니다. "
-                "시간 단위는 1일=8시간, 1월=176시간, 1년=2112시간 가정으로 환산하며, 간접비·이윤은 협력사 제출액과 업로드 재무기준 상단 범위를 넘지 않도록 자동 상한을 적용합니다. "
-                "Base와 협력사 제출 실제 비중의 차이가 15%p 이상이면 예외보정으로 협력사 제출/당사 목표 평균값을 사용합니다."
-            )
-            cost_reference_coverage = standard_reference.get('coverage', '')
-            cost_reference_notes = standard_reference.get('notes', [])
-            if reference_source_label:
-                cost_reference_notes = [f"기준 출처: {reference_source_label}"] + cost_reference_notes
-        elif reference_mode == "quick_industry_proxy":
-            cost_reference_note = (
-                "공시기준가 열은 사업자등록증 기반 업종 프록시 기준과 standard_db 직접비를 이용해 빠른 분석용으로 산출한 참조 금액입니다. "
-                "정밀 판정은 협력사 재무제표 업로드 후 생성한 재무기준을 우선 사용해야 합니다."
-            )
-            cost_reference_coverage = standard_reference.get('coverage', '')
-            cost_reference_notes = standard_reference.get('notes', [])
-            if reference_source_label:
-                cost_reference_notes = [f"기준 출처: {reference_source_label}"] + cost_reference_notes
-        else:
-            cost_reference_note = (
-                "공시기준가 열은 standard_db 기준으로 직접노무비(표준단가×수량), 직접재료비(존재 시 반영), 간접비(INDIRECT_RATIO 중간비율) 순으로 산출한 참조 금액입니다. "
-                "카테고리는 접두사 차이를 정규화해 매칭하고, 카테고리 매칭 실패 시 다른 업종 DB로 확장하지 않습니다. "
-                "시간 단위는 1일=8시간, 1월=176시간, 1년=2112시간 가정으로 환산하며, 간접비·이윤은 협력사 제출액과 업로드 재무기준 상단 범위를 넘지 않도록 자동 상한을 적용합니다. "
-                "다만 업로드 재무기준 Base와 협력사 제출 실제 비중의 차이가 15%p 이상이면 예외보정으로 협력사 제출/당사 목표 평균값을 사용합니다."
-            )
-            cost_reference_coverage = standard_reference.get('coverage', '')
-            cost_reference_notes = standard_reference.get('notes', [])
 
         def format_amount_with_ratio(val, ratio=None):
             s_val = f"{val:,.0f}"
@@ -3143,14 +1979,10 @@ class CategoryAnalysisEngine:
             'outliers': outliers,
             'validation_errors': validation_errors,
             'adequacy_report': adequacy_report,
-            'cost_reference_note': cost_reference_note,
-            'cost_reference_coverage': cost_reference_coverage,
-            'cost_reference_notes': cost_reference_notes + exception_notes,
-            'target_labor_basis_note': (
-                "당사 목표는 협력사 업로드 재무제표 기준 Base 비율을 우선 사용해 자동 산정되며, 현실적 타결가는 협력사 제출가와 내부 목표 사이에서 비목별로 자동 조정됩니다."
-                if use_uploaded_financial_reference
-                else "당사 목표는 표준DB 직접비와 업로드 재무기준 비율을 이용해 자동 산정되며, 현실적 타결가는 협력사 제출가와 내부 목표 사이에서 비목별로 자동 조정됩니다."
-            ),
+            'cost_reference_note': "공시기준가 열은 standard_db 기준으로 직접노무비(표준단가×수량), 직접재료비(존재 시 반영), 간접비(INDIRECT_RATIO 중간비율) 순으로 산출한 참조 금액입니다. 카테고리는 접두사 차이를 정규화해 매칭하고, 카테고리 매칭 실패 시 다른 업종 DB로 확장하지 않습니다. 시간 단위는 1일=8시간, 1월=176시간, 1년=2112시간 가정으로 환산하며, 간접비·이윤은 협력사 제출액과 baseline 상단 범위를 넘지 않도록 자동 상한을 적용합니다. 다만 산업 baseline Base와 협력사 제출 실제 비중의 차이가 15%p 이상이면 예외보정으로 협력사 제출/당사 목표 평균값을 사용합니다.",
+            'cost_reference_coverage': standard_reference.get('coverage', ''),
+            'cost_reference_notes': standard_reference.get('notes', []) + exception_notes,
+            'target_labor_basis_note': "당사 목표는 표준DB 직접비와 산업 baseline 기준 비율을 이용해 자동 산정되며, 현실적 타결가는 협력사 제출가와 내부 목표 사이에서 비목별로 자동 조정됩니다.",
             'target_policy_notes': target_policy_notes,
             'analysis_category': strategy_category,
             'analysis_category_display': category_display,
@@ -3158,10 +1990,6 @@ class CategoryAnalysisEngine:
             'analysis_category_mix': category_context.get('mix_rows', []),
             'analysis_category_group_mix': category_context.get('group_mix_rows', []),
             'analysis_category_mode': category_context.get('mode', '자동 인식'),
-            'should_cost': should_cost_result,
-            'should_cost_summary': should_cost_summary,
-            'financial_ratios': financial_ratios,
-            'reference_mode': reference_mode,
         }, None
 
 class SecureHardcodedChatbot:
@@ -3359,25 +2187,6 @@ def get_cached_font(size):
         except: continue
     return ImageFont.load_default()
 
-
-def get_cached_emoji_font(size):
-    for font_name in ["seguiemj.ttf", "Segoe UI Emoji.ttf"]:
-        try:
-            return ImageFont.truetype(font_name, size)
-        except Exception:
-            continue
-    return None
-
-
-def _normalize_strategy_report_text(text: str, emoji_font_available: bool) -> str:
-    return (
-        str(text or "")
-        .replace("🚨", "★ 1순위")
-        .replace("✅", "● 우수")
-        .replace("⚠️", "▲ 주의")
-        .replace("⚠", "▲ 주의")
-    )
-
 def create_strategy_report_image(category, v_total, r_total, summary_df, adopted_strategies, ai_strategy=""):
     # [NEW 핵심 패치] AI 텍스트 및 마크다운 표 출력을 위해 폭(W)과 높이(H)를 대폭 확장 (잘림 방지)
     W, H = 1200, 15000 
@@ -3389,8 +2198,6 @@ def create_strategy_report_image(category, v_total, r_total, summary_df, adopted
     font_subtitle = get_cached_font(16) 
     font_header = get_cached_font(18) 
     font_body = get_cached_font(14)
-    font_emoji = get_cached_emoji_font(14)
-    emoji_font_available = font_emoji is not None
     
     d.rectangle([(0, 0), (W, 90)], fill=(30, 58, 138)) 
     d.text((MARGIN_X, 28), "AI Buying Strategy Report", font=font_title, fill='white')
@@ -3477,11 +2284,13 @@ def create_strategy_report_image(category, v_total, r_total, summary_df, adopted
                 
                 cell_w = (W - (MARGIN_X*2)) / max(1, len(cells))
                 for i, cell in enumerate(cells):
-                    safe_cell = _normalize_strategy_report_text(cell, emoji_font_available)
+                    # PIL에서 깨지는 이모지를 텍스트로 치환하여 안전하게 출력
+                    safe_cell = cell.replace('🚨', '[1순위]').replace('✅', '[우수]').replace('⚠️', '[주의]')
                     d.text((MARGIN_X + (i * cell_w) + 10, current_y), safe_cell, font=font_body, fill='#1E3A8A')
                 current_y += 25
             else:
-                safe_paragraph = _normalize_strategy_report_text(paragraph, emoji_font_available)
+                # 일반 텍스트 렌더링
+                safe_paragraph = paragraph.replace('🚨', '[1순위]').replace('✅', '[우수]').replace('⚠️', '[주의]')
                 wrapped = wrap_text_pixel(safe_paragraph, font_body, W - (MARGIN_X*2))
                 for w_line in wrapped:
                     if current_y > H - 150: break
@@ -3745,17 +2554,13 @@ def get_analysis_engine():
 def main():
     apply_custom_css()
 
+    if 'adopted_strategies' not in st.session_state: st.session_state['adopted_strategies'] = []
     if 'analysis_done' not in st.session_state: st.session_state['analysis_done'] = False
+    if 'current_advice' not in st.session_state: st.session_state['current_advice'] = None
+    if 'logic_info' not in st.session_state: st.session_state['logic_info'] = None
     if 'uploader_id' not in st.session_state: st.session_state['uploader_id'] = 0
     if 'ai_generated_strategy' not in st.session_state: st.session_state['ai_generated_strategy'] = None
-    if 'exaone_response_cache' not in st.session_state: st.session_state['exaone_response_cache'] = {}
-    if 'financial_upload_signature' not in st.session_state: st.session_state['financial_upload_signature'] = ""
-    if 'financial_upload_cache' not in st.session_state: st.session_state['financial_upload_cache'] = []
-    if 'financial_classification_signature' not in st.session_state: st.session_state['financial_classification_signature'] = ""
-    if 'financial_classification_cache' not in st.session_state: st.session_state['financial_classification_cache'] = None
-    if 'estimate_parse_signature' not in st.session_state: st.session_state['estimate_parse_signature'] = ""
-    if 'estimate_parse_cache' not in st.session_state: st.session_state['estimate_parse_cache'] = None
-    if 'estimate_parse_meta_cache' not in st.session_state: st.session_state['estimate_parse_meta_cache'] = None
+    if 'last_strategy_query' not in st.session_state: st.session_state['last_strategy_query'] = ""
 
     st.markdown("""
         <div class="header-box">
@@ -3769,14 +2574,15 @@ def main():
     engine = get_analysis_engine()
     is_locked = False
     has_result = st.session_state.get('res') is not None
-    supplier_reference_ctx = st.session_state.get('supplier_reference_ctx')
+    baseline_index_df = list_available_baselines()
+    has_baseline = not baseline_index_df.empty
+    selected_industry_group = ""
     selected_baseline_period = ""
-    business_certificate_info = st.session_state.get("business_certificate_info")
-    supplier_name = st.session_state.get("supplier_name_input", "")
-    supplier_business_id = st.session_state.get("supplier_business_id_input", "")
-    supplier_location = st.session_state.get("supplier_location_input", "")
-    supplier_listing_status = st.session_state.get("supplier_listing_status_input", "비상장")
-    supplier_doc_summary = st.session_state.get("supplier_doc_summary_input", "")
+
+    if has_baseline:
+        baseline_index_df = baseline_index_df.copy()
+        baseline_index_df["industry_group"] = baseline_index_df["industry_group"].astype(str)
+        baseline_index_df["period_key"] = baseline_index_df["period_key"].astype(str)
 
     with st.sidebar:
         st.header("설정 (Settings)")
@@ -3818,293 +2624,168 @@ def main():
                 st.caption("카테고리/비목/품명/등급/단위를 조합해 원가 체계를 자동 인식합니다.")
 
         st.markdown("---")
-        st.markdown("##### 수동 재무 기준 업로드")
-        st.caption("API 대신 직접 내려받은 재무자료를 업로드해 비목 적정성 기준을 만듭니다.")
-        business_cert_file = st.file_uploader(
-            "사업자등록증",
-            type=BUSINESS_CERT_UPLOAD_TYPES,
-            key=f"business_cert_uploader_{st.session_state['uploader_id']}",
-            help="사업자등록증을 업로드하면 OCR로 협력사 기본 정보를 자동 입력합니다.",
-        )
-        if business_cert_file is not None:
-            cert_bytes = business_cert_file.getvalue()
-            cert_digest = hashlib.sha1(cert_bytes).hexdigest()
-            if cert_digest != st.session_state.get("business_certificate_digest"):
-                try:
-                    business_certificate_info = extract_business_certificate_info(business_cert_file)
-                    st.session_state["business_certificate_digest"] = cert_digest
-                    st.session_state["business_certificate_info"] = business_certificate_info
-                    if business_certificate_info.get("company_name"):
-                        st.session_state["supplier_name_input"] = business_certificate_info["company_name"]
-                        supplier_name = business_certificate_info["company_name"]
-                    if business_certificate_info.get("business_id"):
-                        st.session_state["supplier_business_id_input"] = business_certificate_info["business_id"]
-                        supplier_business_id = business_certificate_info["business_id"]
-                    if business_certificate_info.get("location"):
-                        st.session_state["supplier_location_input"] = business_certificate_info["location"]
-                        supplier_location = business_certificate_info["location"]
-                    summary_lines = []
-                    if business_certificate_info.get("business_type"):
-                        summary_lines.append(f"업태: {business_certificate_info['business_type']}")
-                    if business_certificate_info.get("business_item"):
-                        summary_lines.append(f"종목: {business_certificate_info['business_item']}")
-                    if business_certificate_info.get("industry_group"):
-                        summary_lines.append(
-                            f"추정 산업군: {business_certificate_info['industry_label']} ({business_certificate_info['industry_group']})"
-                        )
-                    st.session_state["supplier_doc_summary_input"] = " / ".join(summary_lines)
-                    supplier_doc_summary = st.session_state["supplier_doc_summary_input"]
-                except Exception as business_cert_error:
-                    st.error(f"사업자등록증 OCR 실패: {business_cert_error}")
-
-        business_certificate_info = st.session_state.get("business_certificate_info")
-        if business_certificate_info:
-            st.caption(
-                f"OCR 인식: {business_certificate_info.get('summary_text') or '주요 정보 추출 완료'}"
-            )
-            st.caption(
-                f"산업군 자동 추정 근거: {business_certificate_info.get('industry_reason', '-')}"
-            )
-
-        supplier_name = st.text_input(
-            "협력사명",
-            value=supplier_name,
-            key="supplier_name_input",
-            disabled=is_locked,
-        )
-        supplier_business_id = st.text_input(
-            "사업자등록번호",
-            value=supplier_business_id,
-            key="supplier_business_id_input",
-            disabled=is_locked,
-        )
-        supplier_location = st.text_input(
-            "공장 소재지",
-            value=supplier_location,
-            key="supplier_location_input",
-            disabled=is_locked,
-        )
-        supplier_listing_status = st.selectbox(
-            "상장 상태",
-            ["비상장", "상장"],
-            index=0 if supplier_listing_status != "상장" else 1,
-            key="supplier_listing_status_input",
-            disabled=is_locked,
-        )
-        supplier_doc_summary = st.text_area(
-            "협력사 설명/보충 메모",
-            value=supplier_doc_summary,
-            key="supplier_doc_summary_input",
-            height=100,
-            disabled=is_locked,
-            help="외주 구조, 현장 설치, 프로젝트형 수행 등 정성 정보를 적어둘 수 있습니다.",
-        )
-
-        widget_financial_files = st.file_uploader(
-            "재무제표",
-            type=FINANCIAL_UPLOAD_TYPES,
-            key=f"financial_uploader_bundle_{st.session_state['uploader_id']}",
-            accept_multiple_files=True,
-            help="재무상태표, 손익계산서, 현금흐름표, 제조원가명세서를 한 곳에 업로드해 두면 `분석 실행` 시 파일명/본문을 보고 자동 분류합니다.",
-        )
-        using_cached_financial_files = False
-        if widget_financial_files:
-            cached_financial_payloads = []
-            for uploaded_file in widget_financial_files:
-                cached_financial_payloads.append(
-                    {"name": uploaded_file.name, "data": uploaded_file.getvalue()}
-                )
-            st.session_state["financial_upload_cache"] = cached_financial_payloads
-            uploaded_financial_files = [
-                BufferedUpload(cached["name"], cached["data"])
-                for cached in cached_financial_payloads
-            ]
-        elif st.session_state.get("financial_upload_cache"):
-            uploaded_financial_files = [
-                BufferedUpload(cached["name"], cached["data"])
-                for cached in st.session_state.get("financial_upload_cache", [])
-            ]
-            using_cached_financial_files = True
-        else:
-            uploaded_financial_files = []
-
-        current_financial_signature = "|".join(
-            sorted(_fast_upload_signature(uploaded_file) for uploaded_file in (uploaded_financial_files or []))
-        )
-        if current_financial_signature != st.session_state.get('financial_upload_signature', ""):
-            st.session_state['financial_upload_signature'] = current_financial_signature
-            st.session_state.pop('supplier_reference_ctx', None)
-            st.session_state.pop('sidebar_selected_baseline_period_rev', None)
-            st.session_state['financial_classification_signature'] = ""
-            st.session_state['financial_classification_cache'] = None
-            supplier_reference_ctx = None
-        uploaded_financial_count = len(uploaded_financial_files or [])
-        reference_ready = bool(supplier_reference_ctx)
-        recognized_statement_count = len((supplier_reference_ctx or {}).get("available_statement_types", []))
-
-        latest_detected_map = dict(((supplier_reference_ctx or {}).get("classification_meta") or {}).get("detected_map") or {})
-        if latest_detected_map:
-            recognized_text = ", ".join(
-                f"{FINANCIAL_UPLOAD_LABELS.get(statement_type, statement_type)}={filename}"
-                for statement_type, filename in latest_detected_map.items()
-            )
-            st.caption(f"자동 분류(최근 분석 기준): {recognized_text}")
-        if using_cached_financial_files:
-            st.caption("업로드 파일이 세션 캐시에서 복원되었습니다. 파일 목록이 비어 보이면 다시 업로드하거나 아래 초기화 버튼으로 캐시를 비워 주세요.")
-        if uploaded_financial_count and not reference_ready:
-            st.caption("재무제표는 업로드만 완료했고, 자동 분류와 재무 기준 생성은 `분석 실행` 시 한 번에 수행합니다.")
-
-        st.markdown("##### 재무 기준 준비 상태")
-        status_col1, status_col2, status_col3 = st.columns(3)
-        with status_col1:
-            st.metric("업로드", f"{uploaded_financial_count}건")
-        with status_col2:
-            st.metric("자동 분류", f"{recognized_statement_count}종" if reference_ready else "대기")
-        with status_col3:
-            st.metric("재무 기준", "완료" if reference_ready else "분석 시 생성")
-
-        if not uploaded_financial_count:
-            st.caption("1. 재무제표 업로드")
-        else:
-            st.caption("1. 업로드 완료 · 2. 견적서 첨부 후 `분석 실행` 시 자동 분류/재무 기준 생성")
-
-        def _get_financial_classification():
-            cached_signature = st.session_state.get("financial_classification_signature", "")
-            cached_classification = st.session_state.get("financial_classification_cache")
-            if (
-                current_financial_signature
-                and current_financial_signature == cached_signature
-                and cached_classification is not None
-            ):
-                return cached_classification
-
-            classification_meta = classify_financial_statement_uploads(uploaded_financial_files)
-            st.session_state["financial_classification_signature"] = current_financial_signature
-            st.session_state["financial_classification_cache"] = classification_meta
-            return classification_meta
-
-        def _build_supplier_reference_ctx():
-            financial_classification = _get_financial_classification()
-            if not financial_classification["statement_files"]:
-                raise ValueError("업로드한 재무제표를 자동 분류하지 못했습니다. 파일명 또는 본문 형식을 확인해 주세요.")
-            return _prepare_uploaded_supplier_reference(
-                supplier_name,
-                (business_certificate_info or {}).get("industry_group"),
-                financial_classification["statement_files"],
-                business_info=business_certificate_info,
-                statement_period_candidates=financial_classification["detected_years"],
-                classification_meta=financial_classification,
-            )
-
-        if st.button(
-            "기준 초기화",
-            use_container_width=True,
-            disabled=not reference_ready,
-        ):
-            st.session_state.pop('supplier_reference_ctx', None)
-            st.session_state.pop('sidebar_selected_baseline_period_rev', None)
-            safe_rerun()
-        if using_cached_financial_files and st.button("업로드 캐시 비우기", use_container_width=True):
-            st.session_state["financial_upload_cache"] = []
-            st.session_state["financial_upload_signature"] = ""
-            st.session_state["financial_classification_signature"] = ""
-            st.session_state["financial_classification_cache"] = None
-            st.session_state.pop('supplier_reference_ctx', None)
-            st.session_state.pop('sidebar_selected_baseline_period_rev', None)
-            safe_rerun()
-
-        if supplier_reference_ctx:
-            period_options = supplier_reference_ctx.get("period_keys", [])
-            default_period = supplier_reference_ctx.get("selected_period")
-            default_index = period_options.index(default_period) if default_period in period_options else 0
-            selected_baseline_period = st.selectbox(
-                "분석 기준 연도",
-                period_options,
-                index=default_index,
-                key="sidebar_selected_baseline_period_rev",
+        st.markdown("##### 산업 baseline")
+        if has_baseline:
+            available_groups = sorted(baseline_index_df["industry_group"].dropna().unique().tolist())
+            group_options = [""] + available_groups
+            selected_industry_group = st.selectbox(
+                "산업군",
+                group_options,
+                format_func=lambda code: "선택해 주세요" if not code else f"{INDUSTRY_GROUP_LABELS.get(code, code)} ({code})",
+                key="sidebar_selected_industry_group",
                 disabled=is_locked,
+                help="선택한 산업군의 baseline이 견적 적정성 판정에 바로 반영됩니다.",
             )
-            if selected_baseline_period != supplier_reference_ctx.get("selected_period"):
-                supplier_reference_ctx["selected_period"] = selected_baseline_period
-                supplier_reference_ctx["financial_ratios"] = _extract_financial_ratios_from_ingest(
-                    supplier_reference_ctx["workbook_path"],
-                    supplier_reference_ctx["industry_group"],
-                    period_options,
-                    selected_period=selected_baseline_period,
+            if selected_industry_group:
+                filtered_baseline_df = baseline_index_df[
+                    baseline_index_df["industry_group"] == selected_industry_group
+                ].sort_values("period_key", ascending=False)
+                available_periods = filtered_baseline_df["period_key"].tolist()
+                selected_baseline_period = st.selectbox(
+                    "baseline 기간",
+                    available_periods,
+                    key="sidebar_selected_baseline_period",
+                    disabled=is_locked,
                 )
-                st.session_state["supplier_reference_ctx"] = supplier_reference_ctx
-            st.caption(f"기준 파일: {supplier_reference_ctx.get('uploaded_summary', '-')}")
-            st.caption(
-                f"rows_written={int(supplier_reference_ctx.get('rows_written', 0))} / "
-                f"restatement={bool(supplier_reference_ctx.get('restatement_detected'))}"
-            )
-            if supplier_reference_ctx.get("fallback_note"):
-                st.caption(f"기준 생성 방식: {supplier_reference_ctx.get('fallback_note')}")
-        elif uploaded_financial_count:
-            st.caption("분석 실행 시 파일명/본문을 기준으로 자동 분류하고 재무 기준을 생성합니다.")
+                selected_baseline_meta = filtered_baseline_df[
+                    filtered_baseline_df["period_key"] == selected_baseline_period
+                ].iloc[0]
+                st.caption(
+                    f"{INDUSTRY_GROUP_LABELS.get(selected_industry_group, selected_industry_group)} ({selected_industry_group})"
+                )
+                st.caption(
+                    f"item_count={int(selected_baseline_meta['item_count'])} / "
+                    f"cost_presence={bool(selected_baseline_meta['cost_presence_flag'])}"
+                )
+            else:
+                st.caption("산업군을 선택하면 사용 가능한 baseline 기간이 표시됩니다.")
+        else:
+            st.info("적재된 baseline이 없습니다. industry_financial_db.xlsx에 baseline을 먼저 준비해 주세요.")
         
         st.markdown("---")
         if has_result and st.button("분석 결과 초기화", use_container_width=True):
-            chatbot = st.session_state.get('chatbot')
-            if chatbot is not None and getattr(chatbot, 'nlp_engine', None) is not None:
-                chatbot.nlp_engine.clear_fingerprints()
             st.session_state['analysis_done'] = False
             st.session_state['res'] = None
+            st.session_state['adopted_strategies'] = []
+            st.session_state['current_advice'] = None
+            st.session_state['logic_info'] = None
             st.session_state['ai_generated_strategy'] = None
-            st.session_state['estimate_parse_signature'] = ""
-            st.session_state['estimate_parse_cache'] = None
-            st.session_state['estimate_parse_meta_cache'] = None
+            st.session_state['last_strategy_query'] = ""
             
             st.session_state['uploader_id'] += 1
-            safe_rerun()
+            if hasattr(st, 'rerun'): st.rerun()
+            else: st.experimental_rerun()
 
-    def _compose_analysis_meta(active_reference_ctx, active_period):
-        current_fin_ratios = dict((active_reference_ctx or {}).get("financial_ratios") or {})
-        current_industry_group = active_reference_ctx["industry_group"] if active_reference_ctx else (business_certificate_info or {}).get("industry_group", "")
-        reference_mode = active_reference_ctx.get("mode", "") if active_reference_ctx else ""
-        reference_source_label = ""
-        if active_reference_ctx:
-            reference_source_label = (
-                active_reference_ctx.get("uploaded_summary")
-                or active_reference_ctx.get("fallback_note")
-                or active_reference_ctx.get("industry_label", "")
+    with st.expander("현재 선택된 산업 baseline", expanded=True):
+        if has_baseline and selected_industry_group and selected_baseline_period:
+            preview_items = get_baseline_items(selected_industry_group, selected_baseline_period)
+            preview_df = pd.DataFrame(
+                [
+                    {
+                        "비목": row["label"],
+                        "Base": f"{float(row['base_pct']):.2f}%",
+                        "Target": f"{float(row['low_pct']):.1f}% ~ {float(row['high_pct']):.1f}%",
+                        "기준 유형": BASIS_TYPE_LABELS.get(str(row["basis_type"]), str(row["basis_type"])),
+                        "신뢰도": CONFIDENCE_LABELS.get(str(row["confidence_grade"]), str(row["confidence_grade"])),
+                        "신뢰도 산식": row.get("confidence_note", ""),
+                        "근거 계정": row["supporting_accounts"],
+                    }
+                    for row in preview_items
+                ]
             )
-        return {
-            "company_name": supplier_name,
-            "business_id": supplier_business_id,
-            "location": supplier_location,
-            "industry_group": current_industry_group,
-            "industry_group_name": (
-                f"{supplier_name} 업로드 재무기준"
-                if supplier_name
-                else (business_certificate_info or {}).get("industry_label", "")
-            ),
-            "baseline_period": active_period,
-            "industry_code": current_industry_group,
-            "industry_db_path": active_reference_ctx["workbook_path"] if active_reference_ctx else None,
-            "period_basis": active_period,
-            "scope": supplier_listing_status,
-            "quote_subtype": "자동",
-            "company_doc_summary": supplier_doc_summary,
-            "manual_tags": [],
-            "reference_mode": reference_mode,
-            "reference_source_label": reference_source_label,
-            "financial_ratios": current_fin_ratios,
-            "observed_material_ratio": current_fin_ratios.get("observed_material_ratio"),
-            "observed_labor_ratio": current_fin_ratios.get("observed_labor_ratio"),
-            "observed_expense_ratio": current_fin_ratios.get("observed_expense_ratio"),
-            "observed_gna_ratio": current_fin_ratios.get("observed_gna_ratio"),
-            "observed_profit_ratio": current_fin_ratios.get("observed_profit_ratio"),
-            "observed_rnd_ratio": current_fin_ratios.get("observed_rnd_ratio"),
-            "sales_growth_yoy": current_fin_ratios.get("sales_growth_yoy"),
-            "op_margin_delta_yoy": current_fin_ratios.get("op_margin_delta_yoy"),
-            "sales_growth_qoq": current_fin_ratios.get("sales_growth_qoq"),
-            "op_margin_delta_qoq": current_fin_ratios.get("op_margin_delta_qoq"),
-        }
+            st.success(
+                f"현재 판정 기준: {INDUSTRY_GROUP_LABELS.get(selected_industry_group, selected_industry_group)} "
+                f"({selected_industry_group}) | {selected_baseline_period}"
+            )
+            st.caption("기준 유형: 실측 기반=재무제표/원가명세서 직접 관측, 복원 기반=회계식 복원값을 공식 기준과 교차검증, 업종 프록시=업종 혼합비율 대체, 보수 추정=직접 근거는 있으나 정합성이 낮아 보수적으로 반영")
+            st.caption("신뢰도 산식: 기본점수(observed 0.85 / repaired 0.72 / proxy 0.70 / estimated 0.55) + 근거계정/공식정합/복원공식/직접비정합 보너스 - 직접원가근거 부재/재작성표시 감점")
+            st.caption("신뢰도 등급: 높음(A) ≥ 0.85, 보통(B) ≥ 0.70, 낮음(C) ≥ 0.55, 매우 낮음(D) < 0.55")
+            st.dataframe(preview_df, use_container_width=True, height=260)
+        else:
+            st.info("좌측 설정 바에서 산업군 baseline을 먼저 선택해 주세요.")
 
-    context_text = ""
-    template_col, upload_col = st.columns([1, 1.3])
-    with template_col:
+    research_payload = None
+    research_html = None
+    if has_baseline and selected_industry_group and selected_baseline_period:
+        try:
+            research_payload = build_industry_research_payload(
+                selected_industry_group,
+                selected_baseline_period,
+                industry_group_name=INDUSTRY_GROUP_LABELS.get(selected_industry_group, selected_industry_group),
+            )
+            research_html = generate_industry_research_html(research_payload)
+        except Exception as research_error:
+            st.warning(f"산업 리서치 리포트 생성 중 오류가 발생했습니다: {research_error}")
+
+    if research_payload and research_html:
+        st.markdown('<div class="section-header-l1">00. 산업 비목 리서치 리포트</div>', unsafe_allow_html=True)
+        left_col, right_col = st.columns([1.1, 1.2])
+        with left_col:
+            st.markdown(
+                f"""
+                <div class="insight-card">
+                    <div class="insight-title">리포트 요약</div>
+                    <div><strong>산업군:</strong> {research_payload['profile_label']}</div>
+                    <div><strong>기준 기간:</strong> {research_payload['period_key']}</div>
+                    <div><strong>활용 판단:</strong> {research_payload['rating']}</div>
+                    <div style="margin-top:8px;">{research_payload['rating_note']}</div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+            for idx, point in enumerate(research_payload["summary_points"], start=1):
+                st.markdown(
+                    f"""
+                    <div class="insight-card">
+                        <div class="insight-title">핵심 인사이트 {idx}</div>
+                        {point}
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+        with right_col:
+            with st.expander("산업 리서치 리포트 미리보기", expanded=False):
+                st.components.v1.html(research_html, height=1250, scrolling=True)
+            st.download_button(
+                "산업 리서치 리포트 다운로드 (.html)",
+                research_html.encode("utf-8"),
+                f"Industry_Research_{selected_industry_group}_{selected_baseline_period}.html",
+                "text/html",
+                use_container_width=True,
+            )
+
+    analysis_meta = {
+        "company_name": "",
+        "industry_group": selected_industry_group,
+        "industry_group_name": INDUSTRY_GROUP_LABELS.get(selected_industry_group, selected_industry_group),
+        "baseline_period": selected_baseline_period,
+        "industry_code": "",
+        "period_basis": selected_baseline_period,
+        "scope": "불명",
+        "quote_subtype": "자동",
+        "company_doc_summary": "",
+        "manual_tags": [],
+        "observed_gna_ratio": None,
+        "observed_profit_ratio": None,
+        "observed_rnd_ratio": None,
+        "sales_growth_yoy": None,
+        "op_margin_delta_yoy": None,
+        "sales_growth_qoq": None,
+        "op_margin_delta_qoq": None,
+    }
+
+    col_input1, col_input2 = st.columns([2, 1])
+    with col_input1:
+        context_text = ""
+        with st.expander("선택 입력: 전략적 맥락", expanded=False):
+            context_text = st.text_area(
+                "전략적 맥락 (Strategic Context)",
+                placeholder="예: 단가 인상 요구, 독점 공급 상황 등",
+                height=100,
+                help="이 입력은 협상 포인트와 AI 서술 생성에만 사용되며, 원가 산정 수치 자체를 직접 바꾸지 않습니다.",
+            )
+
+    with col_input2:
         if 'excel_template_bytes' not in st.session_state:
             st.session_state['excel_template_bytes'] = generate_standard_estimate_template()
             
@@ -4116,117 +2797,87 @@ def main():
             use_container_width=True,
             help="분석에 최적화된 표준 엑셀 양식을 다운로드합니다."
         )
-
-    with upload_col:
+        
         unique_key = f"excel_uploader_{st.session_state['uploader_id']}"
         uploaded_file = st.file_uploader("견적서 업로드 (Excel)", type=['xlsx'], key=unique_key)
+        prepared_input_df = None
+        uploaded_parse_meta = None
         if uploaded_file is not None:
-            st.caption(f"견적서 업로드 완료: {uploaded_file.name} · 분석 실행 시 자동 인식합니다.")
+            try:
+                prepared_input_df, uploaded_parse_meta = load_uploaded_estimate_data(uploaded_file.getvalue())
+                st.caption(uploaded_parse_meta["summary"])
+            except Exception as parse_error:
+                st.error(f"업로드 파일 자동 인식 실패: {parse_error}")
 
-    def _load_prepared_estimate():
-        if uploaded_file is None:
-            raise ValueError("견적서를 먼저 업로드해 주세요.")
-        file_bytes = uploaded_file.getvalue()
-        estimate_signature = _fast_upload_signature(uploaded_file)
-        cached_signature = st.session_state.get("estimate_parse_signature", "")
-        cached_df = st.session_state.get("estimate_parse_cache")
-        cached_meta = st.session_state.get("estimate_parse_meta_cache")
-        if estimate_signature == cached_signature and cached_df is not None:
-            return cached_df.copy(), dict(cached_meta or {})
-
-        prepared_df, parse_meta = load_uploaded_estimate_data(file_bytes)
-        st.session_state["estimate_parse_signature"] = estimate_signature
-        st.session_state["estimate_parse_cache"] = prepared_df.copy()
-        st.session_state["estimate_parse_meta_cache"] = dict(parse_meta or {})
-        return prepared_df.copy(), parse_meta
-
-    def _run_quote_analysis(active_reference_ctx, active_selected_period):
-        active_df_input, active_upload_parse_meta = _load_prepared_estimate()
-        analysis_meta = _compose_analysis_meta(active_reference_ctx, active_selected_period)
-        res, err = engine.analyze(
-            active_df_input.copy(),
-            context_text=context_text,
-            analysis_meta=analysis_meta,
-            category_override=manual_cost_category or None,
-        )
-        if active_upload_parse_meta:
-            res['upload_parse_summary'] = active_upload_parse_meta.get('summary', '')
-            res['upload_parse_notes'] = active_upload_parse_meta.get('notes', [])
-        if active_reference_ctx:
-            res['uploaded_reference_summary'] = active_reference_ctx.get('uploaded_summary', '')
-            res['uploaded_reference_company'] = active_reference_ctx.get('company_name', '')
-            res['uploaded_reference_period'] = active_selected_period
-        st.session_state['res'] = res
-        st.session_state['chatbot'] = SecureHardcodedChatbot(res)
-        st.session_state['analysis_done'] = True
-        return res
-
-    can_run_analysis = bool(uploaded_file) and (bool(uploaded_financial_count) or bool(supplier_reference_ctx))
-    can_run_quick = bool(uploaded_file) and not bool(supplier_reference_ctx) and bool((business_certificate_info or {}).get("industry_group"))
-    if uploaded_file and uploaded_financial_count and not supplier_reference_ctx:
-        st.caption("`분석 실행`을 누르면 견적서 자동 인식과 재무 기준 생성을 한 번에 수행합니다.")
-    elif uploaded_file and not uploaded_financial_count and not supplier_reference_ctx:
-        st.caption("재무제표를 업로드한 뒤 `분석 실행`을 누르거나, 사업자등록증 기반 `빠른 분석`을 사용해 주세요.")
-        if not (business_certificate_info or {}).get("industry_group"):
-            st.caption("빠른 분석을 쓰려면 사업자등록증을 업로드해 산업군 자동 추정을 먼저 완료해 주세요.")
-    elif supplier_reference_ctx and not uploaded_file:
-        st.caption("견적서를 업로드하면 분석 버튼이 활성화됩니다.")
-
-    analysis_btn_col1, analysis_btn_col2 = st.columns(2)
-    with analysis_btn_col1:
-        run_full_analysis = st.button("분석 실행 (Analyze)", use_container_width=True, disabled=not can_run_analysis)
-    with analysis_btn_col2:
-        run_quick_analysis = st.button("⚡ 빠른 분석 (업종 기본 기준)", use_container_width=True, disabled=not can_run_quick)
-
-    if run_full_analysis:
+    if uploaded_file and st.button("분석 실행 (Analyze)", use_container_width=True):
         try:
-            if not uploaded_financial_count and not supplier_reference_ctx:
-                st.error("좌측 설정 바의 재무제표 업로드에 파일을 1개 이상 추가해 주세요.")
+            if not selected_industry_group or not selected_baseline_period:
+                st.error("먼저 좌측 설정 바에서 사용할 산업군 baseline을 선택해 주세요. 기존 baseline이 있으면 재무 PDF 업로드는 필요하지 않습니다.")
                 st.stop()
-            with st.spinner("견적서와 재무제표를 함께 준비하고 분석하는 중입니다..."):
-                active_reference_ctx = supplier_reference_ctx or _build_supplier_reference_ctx()
-                active_selected_period = (
-                    st.session_state.get('sidebar_selected_baseline_period_rev')
-                    or active_reference_ctx.get('selected_period')
-                )
-                if active_selected_period not in (active_reference_ctx.get("period_keys") or []):
-                    active_selected_period = active_reference_ctx.get("selected_period")
-                if active_selected_period != active_reference_ctx.get("selected_period"):
-                    active_reference_ctx["selected_period"] = active_selected_period
-                    active_reference_ctx["financial_ratios"] = _extract_financial_ratios_from_ingest(
-                        active_reference_ctx["workbook_path"],
-                        active_reference_ctx["industry_group"],
-                        active_reference_ctx.get("period_keys", []),
-                        selected_period=active_selected_period,
-                    )
-                st.session_state['supplier_reference_ctx'] = active_reference_ctx
-                st.session_state['sidebar_selected_baseline_period_rev'] = active_selected_period
-                _run_quote_analysis(active_reference_ctx, active_selected_period)
-            safe_rerun()
+            if prepared_input_df is None:
+                prepared_input_df, uploaded_parse_meta = load_uploaded_estimate_data(uploaded_file.getvalue())
+            df_input = prepared_input_df.copy()
+            res, err = engine.analyze(
+                df_input,
+                context_text=context_text,
+                analysis_meta=analysis_meta,
+                category_override=manual_cost_category or None,
+            )
+            if uploaded_parse_meta:
+                res['upload_parse_summary'] = uploaded_parse_meta.get('summary', '')
+                res['upload_parse_notes'] = uploaded_parse_meta.get('notes', [])
+            
+            st.session_state['res'] = res
+            st.session_state['chatbot'] = SecureHardcodedChatbot(res)
+            st.session_state['analysis_done'] = True
+            
+            if hasattr(st, 'rerun'): st.rerun()
+            else: st.experimental_rerun()
         except Exception as e: st.error(f"오류 발생: {e}")
-
-    if run_quick_analysis:
-        try:
-            with st.spinner("사업자등록증 기반 빠른 분석을 준비하는 중입니다..."):
-                quick_reference_ctx = build_quick_industry_reference_ctx(
-                    supplier_name,
-                    business_certificate_info,
-                )
-                st.session_state['supplier_reference_ctx'] = quick_reference_ctx
-                st.session_state['sidebar_selected_baseline_period_rev'] = quick_reference_ctx['selected_period']
-                _run_quote_analysis(quick_reference_ctx, quick_reference_ctx['selected_period'])
-            safe_rerun()
-        except Exception as e:
-            st.error(f"빠른 분석 실행 실패: {e}")
 
     if 'res' in st.session_state and st.session_state['res']:
         res = st.session_state['res']
         if res['validation_errors']: st.error(res['validation_errors'][0])
 
         adequacy_report = res.get('adequacy_report')
-        def render_adequacy_reference_section():
-            if not adequacy_report:
-                return
+        if res.get('upload_parse_summary'):
+            st.caption(f"업로드 자동 인식: {res['upload_parse_summary']}")
+        if res.get('analysis_category_summary'):
+            st.info(res['analysis_category_summary'])
+            group_mix_rows = res.get('analysis_category_group_mix') or []
+            if group_mix_rows:
+                group_summary = ", ".join(
+                    f"{row.get('group_label', row.get('group_id', '-'))} {float(row.get('share_pct', 0.0)):.1f}%"
+                    for row in group_mix_rows[:3]
+                )
+                st.caption(f"상위 그룹 기준: {group_summary}")
+            mix_rows = res.get('analysis_category_mix') or []
+            if mix_rows:
+                with st.expander("원가 체계 인식 상세", expanded=False):
+                    mix_df = pd.DataFrame(
+                        [
+                            {
+                                "원가 체계": row["category"],
+                                "비중": f"{float(row['share_pct']):.1f}%",
+                                "금액 기준": f"{float(row['amount']):,.0f}",
+                                "행 수": int(row["row_count"]),
+                                "판별 근거": row["reason"],
+                            }
+                            for row in mix_rows
+                        ]
+                    )
+                    mix_df.insert(0, "상위 그룹", [row.get("group_label", row.get("category", "-")) for row in mix_rows])
+                    st.dataframe(mix_df, use_container_width=True, hide_index=True)
+        if res.get('target_policy_notes'):
+            with st.expander("자동 목표 산정 기준", expanded=False):
+                st.write(f"- 현재 적용 표준원가체계: {res.get('analysis_category_display', '-')}")
+                for note in res['target_policy_notes']:
+                    st.write(f"- {note}")
+        
+        # [Section 1] Cost Analysis
+        st.markdown('<div class="section-header-l1">01. 비용 구조 분석 (Cost Breakdown)</div>', unsafe_allow_html=True)
+        if adequacy_report:
+            st.markdown('<div class="section-header-l2">1. 비목 적정성 구조 판정 (Quote Adequacy)</div>', unsafe_allow_html=True)
 
             sum_check = next((c for c in adequacy_report['structure_checks'] if c['code'].startswith('SUM_RATIO')), None)
             overall_label_kr = ADEQUACY_JUDGEMENT_LABELS.get(
@@ -4294,48 +2945,8 @@ def main():
                         st.write("- standard_db 참조 산출 메모")
                         for note in res['cost_reference_notes']:
                             st.write(f"  · {note}")
-
-        if res.get('upload_parse_summary'):
-            st.caption(f"업로드 자동 인식: {res['upload_parse_summary']}")
-        if res.get('uploaded_reference_summary'):
-            ref_company = res.get('uploaded_reference_company') or "업로드 협력사"
-            ref_period = res.get('uploaded_reference_period') or "-"
-            st.caption(f"수동 재무 기준: {ref_company} / {ref_period} / {res['uploaded_reference_summary']}")
-        if res.get('analysis_category_summary'):
-            st.info(res['analysis_category_summary'])
-            group_mix_rows = res.get('analysis_category_group_mix') or []
-            if group_mix_rows:
-                group_summary = ", ".join(
-                    f"{row.get('group_label', row.get('group_id', '-'))} {float(row.get('share_pct', 0.0)):.1f}%"
-                    for row in group_mix_rows[:3]
-                )
-                st.caption(f"상위 그룹 기준: {group_summary}")
-            mix_rows = res.get('analysis_category_mix') or []
-            if mix_rows:
-                with st.expander("원가 체계 인식 상세", expanded=False):
-                    mix_df = pd.DataFrame(
-                        [
-                            {
-                                "원가 체계": row["category"],
-                                "비중": f"{float(row['share_pct']):.1f}%",
-                                "금액 기준": f"{float(row['amount']):,.0f}",
-                                "행 수": int(row["row_count"]),
-                                "판별 근거": row["reason"],
-                            }
-                            for row in mix_rows
-                        ]
-                    )
-                    mix_df.insert(0, "상위 그룹", [row.get("group_label", row.get("category", "-")) for row in mix_rows])
-                    st.dataframe(mix_df, use_container_width=True, hide_index=True)
-        if res.get('target_policy_notes'):
-            with st.expander("자동 목표 산정 기준", expanded=False):
-                st.write(f"- 현재 적용 표준원가체계: {res.get('analysis_category_display', '-')}")
-                for note in res['target_policy_notes']:
-                    st.write(f"- {note}")
         
-        # [Section 1] Cost Analysis
-        st.markdown('<div class="section-header-l1">01. 비용 구조 분석 (Cost Breakdown)</div>', unsafe_allow_html=True)
-        st.markdown('<div class="section-header-l2">1. 종합 원가 지표 (Total Cost Overview)</div>', unsafe_allow_html=True)
+        st.markdown('<div class="section-header-l2">2. 종합 원가 지표 (Total Cost Overview)</div>', unsafe_allow_html=True)
         if res.get('target_labor_basis_note'):
             st.caption(res['target_labor_basis_note'])
         col_m1, col_m2, col_m3, col_m4 = st.columns(4)
@@ -4352,7 +2963,7 @@ def main():
         st.write("")
         st.write("") 
 
-        st.markdown('<div class="section-header-l2">2. 비목별 상세 분석표 (Detailed Breakdown)</div>', unsafe_allow_html=True)
+        st.markdown('<div class="section-header-l2">3. 비목별 상세 분석표 (Detailed Breakdown)</div>', unsafe_allow_html=True)
         st.caption(res.get('cost_reference_note', ''))
         if res.get('cost_reference_coverage'):
             st.caption(res['cost_reference_coverage'])
@@ -4365,7 +2976,7 @@ def main():
             st.dataframe(res['summary'], use_container_width=True, height=300)
 
         auto_points = build_auto_negotiation_points(res)
-        st.markdown('<div class="section-header-l2">3. 자동 협상 포인트</div>', unsafe_allow_html=True)
+        st.markdown('<div class="section-header-l2">4. 자동 협상 포인트</div>', unsafe_allow_html=True)
         if auto_points:
             for point in auto_points:
                 st.markdown(
@@ -4380,143 +2991,232 @@ def main():
         else:
             st.success("자동 추출된 우선 협상 포인트가 없습니다.")
 
-        if res.get('should_cost_summary'):
-            st.markdown('<div class="section-header-l2">4. 재무 역산 기반 Should-Cost</div>', unsafe_allow_html=True)
-            st.info(res['should_cost_summary'])
+        strategy_category = res.get('analysis_category', '1.일반용역')
+        category_display = res.get('analysis_category_display', strategy_category)
 
-        category_display = res.get('analysis_category_display') or res.get('analysis_category', '1.일반용역')
+        with st.expander("고급 협상 도구 (선택)", expanded=False):
+            st.caption("기본 판단과 자동 협상 포인트로 충분한 경우 이 영역은 건너뛰어도 됩니다.")
 
-        st.markdown('<div class="section-header-l1">02. AI 협상 전략 수립 (EXAONE LLM)</div>', unsafe_allow_html=True)
-        default_role = (
-            "당신은 구매/재무 분석 AI입니다.\n"
-            "업종 기준선(aggregate)과 기업 문서 태그를 사용해 견적 비목의 적정성을 판정하고, "
-            "observed / repaired / proxy / estimated basis_type, confidence, reason_code를 명시하는 검토자입니다.\n"
-            "raw 분포가 없으면 median/Q1/Q3/IQR을 만들지 말고, QoQ/YoY 변화, 합계 정합성, 구조 룰로 보강 판정해야 합니다."
-        )
-        default_request = (
-            "아래 제공된 [협력사 재무 역산 컨텍스트], [구조화 판정 데이터], [비용 구조 분석 결과], "
-            "[Should-Cost 역산 결과], [자동 협상 포인트], [전략 참고 정보]를 종합하여 "
-            "5개 섹션 구조의 협상 리포트를 작성해 주세요."
-        )
+            st.markdown('<div class="section-header-l1">02. 지능형 협상 전략 코치 (Negotiation Strategy Coach)</div>', unsafe_allow_html=True)
+            col_ui, col_res = st.columns([1, 1.5], gap="large")
 
-        ai_role = default_role
-        ai_request = default_request
+            with col_ui:
+                st.markdown('<div class="section-header-l2">1. 분석 모드 설정 (Analysis Mode)</div>', unsafe_allow_html=True)
+                q_mode = st.radio("모드 선택", ["상황별 전략 검색", "원가 산출 공식 확인"], label_visibility="collapsed")
 
-        exaone_dependency_error = get_exaone_runtime_error()
-        if exaone_dependency_error:
-            st.warning(exaone_dependency_error)
+                if q_mode == "원가 산출 공식 확인":
+                    st.caption("비목별 상세 산출 기준과 법적/통계적 근거를 조회합니다.")
+                    cat = strategy_category.split('.')[-1]
+                    item = st.selectbox("항목 선택", ["노무비", "경비", "이윤"])
 
-        st.info("현재 분석 결과와 자동 협상 포인트를 바탕으로 EXAONE 보고서를 생성합니다.")
+                    col_btn1, col_btn2 = st.columns(2)
+                    with col_btn1:
+                        if st.button("공식 조회", use_container_width=True):
+                            info = st.session_state['chatbot'].explain_calculation_logic(cat, item)
+                            st.session_state['logic_info'] = info
+                            st.session_state['current_advice'] = None
+                    with col_btn2:
+                        if st.button("초기화", key="reset_logic", use_container_width=True):
+                            st.session_state['logic_info'] = None
+                            st.session_state['current_advice'] = None
+                            if hasattr(st, 'rerun'): st.rerun()
+                            else: st.experimental_rerun()
+                else:
+                    st.caption("협상 이슈 키워드를 입력하여 대응 논리를 검색합니다.")
+                    search_query = st.text_input("키워드 입력", placeholder="예: 단가")
+                    suggested_keywords = st.session_state['chatbot'].get_keyword_suggestions(search_query, strategy_category)
 
-        if st.button("🤖 EXAONE 보고서 작성", use_container_width=True):
-            if exaone_dependency_error:
-                st.error(exaone_dependency_error)
-                st.stop()
+                    selected_suggestion = "직접 입력 사용"
+                    if search_query.strip() and suggested_keywords:
+                        st.caption("입력어가 포함된 DB 키워드 추천입니다.")
+                        selected_suggestion = st.selectbox(
+                            "추천 키워드",
+                            options=["직접 입력 사용"] + suggested_keywords,
+                            index=0,
+                        )
 
-            cost_summary_text = "구분 | 협력사 제출 | 공시기준가(업로드 재무기준) | 당사 목표 | 현실적 타결 | Gap 금액 | 협상 우선순위\n---|---|---|---|---|---|---\n"
-            if st.session_state.get('res') is not None:
-                summary_df = st.session_state['res']['summary']
-                max_gap = 0.0
-                for _, row in summary_df.iterrows():
-                    if row.get('구분', '') == '합계':
-                        continue
-                    gap_val = parse_amount_cell(row.get('1. 협력사 제출', '0')) - parse_amount_cell(row.get('4. 현실적 타결', '0'))
-                    max_gap = max(max_gap, gap_val)
+                    final_query = search_query.strip()
+                    if selected_suggestion != "직접 입력 사용":
+                        final_query = selected_suggestion
 
-                for _, row in summary_df.iterrows():
-                    gubun = row.get('구분', '')
-                    v_submit = row.get('1. 협력사 제출', '0')
-                    v_public = row.get('2. 공시기준가', '0')
-                    v_internal = row.get('3. 당사 목표', '0')
-                    v_target = row.get('4. 현실적 타결', '0')
-                    gap_val = parse_amount_cell(v_submit) - parse_amount_cell(v_target)
-                    gap_str = f"{gap_val:,.0f}원" if gap_val > 0 else "-"
-                    if gubun == '합계':
-                        priority_str = ""
-                    elif gap_val == max_gap and max_gap > 0:
-                        priority_str = "🚨 1순위 타겟"
-                    elif gap_val > 0:
-                        priority_str = "⚠️ 단가 인하 요망"
-                    else:
-                        priority_str = "✅ 경쟁력 우수"
-                    cost_summary_text += f"{gubun} | {v_submit} | {v_public} | {v_internal} | {v_target} | **{gap_str}** | {priority_str}\n"
-                cost_summary_text += f"\n* 총 절감 예상액(Total Gap): {st.session_state['res']['save_amt']:,.0f}원"
+                    col_btn1, col_btn2 = st.columns(2)
+                    with col_btn1:
+                        if st.button("전략 검색", use_container_width=True):
+                            if not final_query:
+                                st.warning("키워드를 직접 입력하거나 목록에서 선택해 주세요.")
+                                advice = None
+                            else:
+                                advice = st.session_state['chatbot'].get_advice(final_query, strategy_category)
+                            st.session_state['logic_info'] = None
+                            if advice:
+                                st.session_state['current_advice'] = advice
+                                st.session_state['last_strategy_query'] = final_query
+                            elif final_query:
+                                st.warning("검색 결과가 없습니다.")
+                    with col_btn2:
+                        if st.button("초기화", key="reset_strat", use_container_width=True):
+                            st.session_state['current_advice'] = None
+                            st.session_state['logic_info'] = None
+                            st.session_state['last_strategy_query'] = ""
+                            if hasattr(st, 'rerun'): st.rerun()
+                            else: st.experimental_rerun()
 
-            auto_points_text = ""
-            for idx, point in enumerate(auto_points, start=1):
-                auto_points_text += f"{idx}. {point['title']}\n   - {point['body']}\n"
-            if not auto_points_text:
-                auto_points_text = "자동 추출된 우선 협상 포인트 없음"
+            with col_res:
+                st.markdown('<div class="section-header-l2">2. 전략 솔루션 (Strategy Solution)</div>', unsafe_allow_html=True)
 
-            strategy_reference_text = "전략 코치 입력 없이 현재 분석 결과와 자동 협상 포인트를 바탕으로 협상 전략을 직접 구성해 주세요."
+                if st.session_state.get('logic_info'):
+                    info = st.session_state['logic_info']
+                    st.markdown(f"""
+                    <div style="background-color:#F8F9FA; padding:20px; border-radius:8px; border:1px solid #E2E8F0;">
+                        <h4 style="color:#1E3A8A; margin-bottom:15px; border-bottom:2px solid #1E3A8A; padding-bottom:10px;">
+                            📘 {info['name']}
+                        </h4>
+                        <p><strong>📐 산출 공식:</strong><br>
+                        <span style="background-color:#EBF8FF; padding:2px 6px; border-radius:4px; font-family:monospace; color:#0369A1;">{info['formula']}</span></p>
+                        <p style="margin-top:15px;"><strong>💡 정의 및 의미:</strong><br>{info.get('definition', '-')}</p>
+                        <p style="margin-top:15px;"><strong>⚖️ 기준 수립 사유 (Legal/Standard):</strong><br>{info.get('reason', '-')}</p>
+                        <div style="margin-top:20px; padding:12px; background-color:#FEF3C7; border-left:4px solid #F59E0B; border-radius:4px;">
+                            <span style="font-weight:bold; color:#92400E;">💡 Check Point:</span><br>
+                            <span style="color:#92400E;">{info['description']}</span>
+                        </div>
+                    </div>
+                    """, unsafe_allow_html=True)
 
-            adequacy_context_text = ""
-            if st.session_state['res'].get('adequacy_report'):
-                adequacy_context_text = build_llm_context(st.session_state['res']['adequacy_report'])
+                if st.session_state.get('current_advice'):
+                    advice = st.session_state['current_advice']
+                    risk_msg = advice.get('Risk_Type', '분석 불가')
+                    t1, t2, t3 = st.tabs(["공격형 (Aggressive)", "방어형 (Defensive)", "상생형 (Win-Win)"])
 
-            financial_forensic_text = ""
-            should_cost_text = ""
-            supplier_ref = st.session_state.get("supplier_reference_ctx")
-            if supplier_ref:
-                should_cost = st.session_state["res"].get("should_cost", {})
-                financial_forensic_text = build_financial_forensic_context(supplier_ref, should_cost)
-                should_cost_text = st.session_state["res"].get("should_cost_summary", "")
-            financial_forensic_text = financial_forensic_text or "재무 역산 컨텍스트 없음"
-            should_cost_text = should_cost_text or "재무 실측 비율이 부족해 Should-Cost 역산 결과를 생성하지 못했습니다."
+                    def render_tab(tab, name, key, uid, subtitle):
+                        with tab:
+                            st.markdown(f"##### {subtitle}")
+                            script = advice.get(key, "-")
+                            st.write(script)
+                            st.write("")
+                            if st.button(f"전략 채택 ({name})", key=uid, use_container_width=True):
+                                display_cat = st.session_state.get('last_strategy_query') or advice.get('Trigger_Keywords', '-')
+                                new_strategy = {
+                                    'category': display_cat,
+                                    'analysis': risk_msg,
+                                    'script': script,
+                                }
+                                is_duplicate = any(
+                                    s.get('category') == new_strategy['category']
+                                    and s.get('analysis') == new_strategy['analysis']
+                                    and s.get('script') == new_strategy['script']
+                                    for s in st.session_state['adopted_strategies']
+                                )
 
-            output_format_instruction = """
-[출력 형식 지시]
-- 반드시 위의 5개 섹션 구조(### 1~5)를 순서대로 작성하세요.
-- 비목별 비교는 마크다운 표(|)로 작성하세요.
-- 협상 발화 예시는 "큰따옴표"로 감싸 명확히 구분하세요.
-- 수치는 원 단위 또는 %p 단위로 구체적으로 제시하세요.
-- 불확실한 추정치는 반드시 "추정:" 접두어를 붙이세요.
-""".strip()
+                                if is_duplicate:
+                                    st.warning("이미 채택된 전략입니다. 중복 채택은 불가합니다.")
+                                else:
+                                    st.session_state['adopted_strategies'].append(new_strategy)
+                                    if hasattr(st, 'rerun'): st.rerun()
+                                    else: st.experimental_rerun()
 
-            final_prompt = (
-                f"{ai_role}\n\n[요청 사항]\n{ai_request}\n\n"
-                f"[협력사 재무 역산 컨텍스트]\n{financial_forensic_text}\n\n"
-                f"[구조화 판정 데이터]\n{adequacy_context_text}\n\n"
-                f"[비용 구조 분석 결과]\n{cost_summary_text}\n\n"
-                f"[Should-Cost 역산 결과]\n{should_cost_text}\n\n"
-                f"[자동 협상 포인트]\n{auto_points_text}\n\n"
-                f"[전략 참고 정보]\n{strategy_reference_text}\n\n"
-                f"{output_format_instruction}"
+                    render_tab(t1, "공격", "Mode_Aggressive", "b1", "⚡ 단기 이익 극대화 및 강경 대응 전략")
+                    render_tab(t2, "방어", "Mode_Defensive", "b2", "🛡️ 리스크 회피 및 논리적 방어 전략")
+                    render_tab(t3, "상생", "Mode_WinWin", "b3", "🤝 장기 파트너십 및 공동 가치 창출 전략")
+
+                if not st.session_state.get('current_advice') and not st.session_state.get('logic_info'):
+                    st.info("좌측 패널에서 검색이나 공식 조회를 실행하면 여기 표시됩니다.")
+
+            st.markdown('<div class="section-header-l1">03. AI 협상 전략 수립 (EXAONE LLM)</div>', unsafe_allow_html=True)
+            default_role = (
+                "당신은 구매/재무 분석 AI입니다.\n"
+                "업종 기준선(aggregate)과 기업 문서 태그를 사용해 견적 비목의 적정성을 판정하고, "
+                "observed / repaired / proxy / estimated basis_type, confidence, reason_code를 명시하는 검토자입니다.\n"
+                "raw 분포가 없으면 median/Q1/Q3/IQR을 만들지 말고, QoQ/YoY 변화, 합계 정합성, 구조 룰로 보강 판정해야 합니다."
+            )
+            default_request = (
+                "아래 제공된 [구조화 판정 데이터]와 [채택된 협상 전략 목록]을 종합하여, "
+                "견적 비목 적정성 리포트와 협상 시나리오를 작성해 주세요."
             )
 
-            prompt_signature = hashlib.sha1(
-                f"{user_defined_model_path}||{final_prompt}".encode("utf-8")
-            ).hexdigest()
-            cached_exaone_response = st.session_state.get("exaone_response_cache", {}).get(prompt_signature)
-            if cached_exaone_response:
-                st.session_state['ai_generated_strategy'] = cached_exaone_response
-                st.markdown(cached_exaone_response)
-                st.caption("동일 입력 기준 EXAONE 캐시 결과를 재사용했습니다.")
+            ai_role = default_role
+            ai_request = default_request
+            with st.expander("프롬프트 고급 조정", expanded=False):
+                col_prompt1, col_prompt2 = st.columns(2)
+                with col_prompt1:
+                    ai_role = st.text_area("역할 부여 (Persona)", value=default_role, height=100)
+                with col_prompt2:
+                    ai_request = st.text_area("요청 사항 (Instruction)", value=default_request, height=100)
+
+            if not st.session_state['adopted_strategies']:
+                st.warning("먼저 위 전략 코치에서 전략을 채택하면 AI 협상 전략 리포트를 생성할 수 있습니다.")
             else:
-                output_container = st.empty()
-                full_generated_text = ""
-                for chunk in ask_exaone_stream(final_prompt, user_defined_model_path):
-                    full_generated_text += chunk
-                    output_container.markdown(full_generated_text + "▌")
+                st.info(f"현재 {len(st.session_state['adopted_strategies'])}개의 전략이 채택되어 있습니다.")
+                if st.button("🤖 EXAONE 종합 협상 전략 완성하기", use_container_width=True):
+                    cost_summary_text = "구분 | 협력사 제출 | 공시기준가(업종 baseline) | 당사 목표 | 현실적 타결 | Gap 금액 | 협상 우선순위\n---|---|---|---|---|---|---\n"
+                    if st.session_state.get('res') is not None:
+                        summary_df = st.session_state['res']['summary']
+                        max_gap = 0.0
+                        for _, row in summary_df.iterrows():
+                            if row.get('구분', '') == '합계':
+                                continue
+                            gap_val = parse_amount_cell(row.get('1. 협력사 제출', '0')) - parse_amount_cell(row.get('4. 현실적 타결', '0'))
+                            max_gap = max(max_gap, gap_val)
 
-                output_container.markdown(full_generated_text)
-                st.session_state.setdefault("exaone_response_cache", {})[prompt_signature] = full_generated_text
-                st.session_state['ai_generated_strategy'] = full_generated_text
+                        for _, row in summary_df.iterrows():
+                            gubun = row.get('구분', '')
+                            v_submit = row.get('1. 협력사 제출', '0')
+                            v_public = row.get('2. 공시기준가', '0')
+                            v_internal = row.get('3. 당사 목표', '0')
+                            v_target = row.get('4. 현실적 타결', '0')
+                            gap_val = parse_amount_cell(v_submit) - parse_amount_cell(v_target)
+                            gap_str = f"{gap_val:,.0f}원" if gap_val > 0 else "-"
+                            if gubun == '합계':
+                                priority_str = ""
+                            elif gap_val == max_gap and max_gap > 0:
+                                priority_str = "🚨 1순위 타겟"
+                            elif gap_val > 0:
+                                priority_str = "⚠️ 단가 인하 요망"
+                            else:
+                                priority_str = "✅ 경쟁력 우수"
+                            cost_summary_text += f"{gubun} | {v_submit} | {v_public} | {v_internal} | {v_target} | **{gap_str}** | {priority_str}\n"
+                        cost_summary_text += f"\n* 총 절감 예상액(Total Gap): {st.session_state['res']['save_amt']:,.0f}원"
 
-        elif st.session_state.get('ai_generated_strategy'):
-            st.markdown(st.session_state['ai_generated_strategy'])
+                    strategies_text = ""
+                    for idx, strat in enumerate(st.session_state['adopted_strategies']):
+                        strategies_text += f"{idx+1}. [{strat['category']}]\n   - 방향: {strat['analysis']}\n   - 스크립트: {strat['script']}\n\n"
+
+                    adequacy_context_text = ""
+                    if st.session_state['res'].get('adequacy_report'):
+                        adequacy_context_text = build_llm_context(st.session_state['res']['adequacy_report'])
+
+                    final_prompt = (
+                        f"{ai_role}\n\n[요청 사항]\n{ai_request}\n\n"
+                        f"[구조화 판정 데이터]\n{adequacy_context_text}\n\n"
+                        f"[비용 구조 분석 결과]\n{cost_summary_text}\n\n"
+                        f"[채택된 협상 전략 목록]\n{strategies_text}"
+                    )
+
+                    output_container = st.empty()
+                    full_generated_text = ""
+                    for chunk in ask_exaone_stream(final_prompt, user_defined_model_path):
+                        full_generated_text += chunk
+                        output_container.markdown(full_generated_text + "▌")
+
+                    output_container.markdown(full_generated_text)
+                    st.session_state['ai_generated_strategy'] = full_generated_text
+
+                elif st.session_state.get('ai_generated_strategy'):
+                    st.markdown(st.session_state['ai_generated_strategy'])
 
         # ==============================================================================
         # [Section 4] Report
         # ==============================================================================
         if adequacy_report:
-            st.markdown('<div class="section-header-l1">03. 비목 적정성 리포트 (Report Generation)</div>', unsafe_allow_html=True)
+            st.markdown('<div class="section-header-l1">04. 비목 적정성 리포트 (Report Generation)</div>', unsafe_allow_html=True)
 
-            with st.expander("업종/비목 적정성 참고 판정", expanded=False):
-                render_adequacy_reference_section()
-            if res.get('should_cost_summary'):
-                with st.expander("재무 역산 기반 Should-Cost 참고", expanded=False):
-                    st.write(res['should_cost_summary'])
+            if st.session_state['adopted_strategies']:
+                for idx, item in enumerate(st.session_state['adopted_strategies']):
+                    st.markdown(f"""
+                    <div class="insight-card">
+                        <div class="insight-title">Strategy {idx+1}. {item['category']}</div>
+                        {item['script']}
+                    </div>
+                    """, unsafe_allow_html=True)
 
             html_report = generate_html_report(
                 adequacy_report,
@@ -4537,13 +3237,13 @@ def main():
                 )
 
             with c_d2:
-                if st.button("이미지 리포트 생성 (Preview)", use_container_width=True):
+                if st.session_state['adopted_strategies'] and st.button("이미지 리포트 생성 (Preview)", use_container_width=True):
                     img = create_strategy_report_image(
                         category_display,
                         res['v_total'],
                         res['r_total'],
                         res['summary'],
-                        [],
+                        st.session_state['adopted_strategies'],
                         st.session_state.get('ai_generated_strategy', "")
                     )
                     st.image(img, caption="Generated Report Preview")
@@ -4558,7 +3258,7 @@ def main():
                     category_display,
                     res['bottom_line'],
                     res['draft_text'],
-                    [],
+                    st.session_state['adopted_strategies'],
                     st.session_state.get('ai_generated_strategy', "")
                 )
                 st.download_button("엑셀 리포트 다운로드 (.xlsx)", excel_data, "Buying_Report_Expert.xlsx", use_container_width=True)

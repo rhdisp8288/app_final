@@ -7,7 +7,7 @@ from typing import Any, Dict, List, Optional
 import math
 import pandas as pd
 
-from industry_financial_db import get_baseline_items, load_industry_db, resolve_workbook_path
+from app.analysis.industry_financial_db import get_baseline_items, load_industry_db, resolve_workbook_path
 
 
 ITEM_ORDER = ["material", "labor", "expense", "gna", "profit", "rnd"]

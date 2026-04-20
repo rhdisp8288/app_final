@@ -19,16 +19,16 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 import json
 from typing import List, Dict, Optional, Any
-from quote_adequacy import (
+from app.analysis.quote_adequacy import (
     build_llm_context,
     evaluate_quote_adequacy,
     generate_html_report,
 )
-from industry_research_report import (
+from app.analysis.industry_research_report import (
     build_industry_research_payload,
     generate_industry_research_html,
 )
-from industry_financial_db import (
+from app.analysis.industry_financial_db import (
     get_baseline_items,
     list_available_baselines,
 )

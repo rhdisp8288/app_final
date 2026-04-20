@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from industry_financial_db import (
+from app.analysis.industry_financial_db import (
     ensure_workbook,
     get_baseline_items,
     ingest_industry_statements,

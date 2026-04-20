@@ -8,7 +8,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import pandas as pd
 
-from industry_financial_db import (
+from app.analysis.industry_financial_db import (
     append_company_tag_evidence,
     append_evaluation_run,
     extract_company_tags,
